@@ -6,10 +6,12 @@
 ## 1. Доска — единственный носитель работы
 
 - Карточка = GitHub issue. Доска = проект «Easy-screenshot-tool». Веха (milestone) = релиз.
-- Статус карточки обязан отражать фактический прогресс. Колонки Status:
-  `Backlog → Ready → Design → Development → Test → In review → Done`.
-- Взял задачу в работу — перевёл карточку в свою колонку: designer → Design, developer →
-  Development, tester → Test, reviewer → In review.
+- Статус карточки обязан отражать фактический прогресс. Колонки Status на доске этого репозитория:
+  `Todo → In Progress → Done` (полный набор Design / Development / Test / In review через API этим
+  токеном не создаётся — дополнительные колонки заводит только владелец доски в UI).
+- Взял задачу в работу — перевёл карточку в `In Progress`. Точный этап цепочки внутри
+  `In Progress` фиксируется меткой: `step:research` → `step:dev` → `step:test` → `step:review` →
+  `step:done`.
 - В `Done` карточка уходит только после approve reviewer; переводит ведущий, не исполнитель.
   Ведущий `Review → Done` не двигает без решения reviewer.
 - Карточка вехи обязана иметь заполненные: Status, milestone, метку приоритета `P0/P1/P2`
