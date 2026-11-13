@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <d2d1.h>
 #include <dwrite.h>
+#include <cmath>
 #include <map>
 #include <string>
 #include "theme.h"
@@ -34,6 +35,89 @@ inline void add_ellipse(ID2D1GeometrySink* s, float cx, float cy, float rx, floa
     s->AddBezier(D2D1_BEZIER_SEGMENT{ { cx - rx, cy - ry * K }, { cx - rx * K, cy - ry }, { cx, cy - ry } });
     s->AddBezier(D2D1_BEZIER_SEGMENT{ { cx + rx * K, cy - ry }, { cx + rx, cy - ry * K }, { cx + rx, cy } });
     s->EndFigure(D2D1_FIGURE_END_CLOSED);
+}
+
+// Undo and redo are one arc drawn twice: once counter-clockwise with the head at its
+// upper-left end, once as its mirror. Sampling the arc is simpler than a bezier and at
+// toolbar glyph size it reads as a curve. The parameters live in one place so the stroke
+// and the filled head cannot drift apart.
+struct ArcSpec {
+    float cx, cy, r, dir, v0, v1;
+
+    D2D1_POINT_2F at(float deg) const {
+        float a = deg * 3.14159265358979f / 180.0f;
+        D2D1_POINT_2F p; p.x = cx + dir * r * cosf(a); p.y = cy - r * sinf(a); return p;
+    }
+    // Unit tangent in the direction of the sweep.
+    D2D1_POINT_2F tangent(float deg) const {
+        float a = deg * 3.14159265358979f / 180.0f;
+        float tx = -dir * sinf(a), ty = -cosf(a);
+        float m = sqrtf(tx * tx + ty * ty);
+        if (m < 1e-6f) m = 1.0f;
+        D2D1_POINT_2F t; t.x = tx / m; t.y = ty / m; return t;
+    }
+};
+
+inline ArcSpec arc_for(int g, float cx, float cy, float b) {
+    ArcSpec a;
+    a.dir = (g == G_UNDO) ? 1.0f : -1.0f;      // redo is undo seen in a mirror
+    a.cx = cx + a.dir * b * 0.04f;
+    a.cy = cy + b * 0.04f;
+    a.r = b * 0.34f;
+    a.v0 = -25.0f;                              // tail, low on the tail side
+    a.v1 = 160.0f;                              // head, high on the head side
+    return a;
+}
+
+inline void add_arc(ID2D1GeometrySink* s, const ArcSpec& a) {
+    const int steps = 16;
+    D2D1_POINT_2F p = a.at(a.v0);
+    s->BeginFigure(p, D2D1_FIGURE_BEGIN_HOLLOW);
+    for (int i = 1; i <= steps; ++i) s->AddLine(a.at(a.v0 + (a.v1 - a.v0) * (float)i / (float)steps));
+    s->EndFigure(D2D1_FIGURE_END_OPEN);
+}
+
+inline void add_arc_head(ID2D1GeometrySink* s, const ArcSpec& a, float b) {
+    D2D1_POINT_2F e = a.at(a.v1);
+    D2D1_POINT_2F t = a.tangent(a.v1);
+    D2D1_POINT_2F n; n.x = -t.y; n.y = t.x;
+    float hl = b * 0.24f, hw = b * 0.16f;
+    s->BeginFigure(D2D1_POINT_2F{ e.x + t.x * hl, e.y + t.y * hl }, D2D1_FIGURE_BEGIN_FILLED);
+    s->AddLine(D2D1_POINT_2F{ e.x + n.x * hw, e.y + n.y * hw });
+    s->AddLine(D2D1_POINT_2F{ e.x - n.x * hw, e.y - n.y * hw });
+    s->EndFigure(D2D1_FIGURE_END_CLOSED);
+}
+
+// Chisel highlighter. The nib and the body are separate quads with a gap between them - that
+// gap is what reads as the ferrule - and a band alongside is the mark it has just laid down.
+// Without the band the glyph is a slanted blob and reads as a second arrow.
+struct MarkerShape {
+    D2D1_POINT_2F nib[4], body[4], streak[4];
+};
+
+inline void marker_shape(float cx, float cy, float b, MarkerShape& m) {
+    const float ux = 0.7071f, uy = -0.7071f;              // along the pen, up and right
+    const float vx = 0.7071f, vy = 0.7071f;               // across the pen, down and right
+    const float nx = cx - b * 0.30f, ny = cy + b * 0.22f; // nib tip
+    const float t1 = b * 0.17f, t2 = b * 0.26f, t3 = b * 0.68f;
+    const float wNib = b * 0.185f, wJoin = b * 0.105f;    // the chisel is much wider than the body
+    const float wBody = b * 0.085f, wCap = b * 0.115f;
+
+    m.nib[0] = D2D1_POINT_2F{ nx + vx * wNib, ny + vy * wNib };
+    m.nib[1] = D2D1_POINT_2F{ nx - vx * wNib, ny - vy * wNib };
+    m.nib[2] = D2D1_POINT_2F{ nx + ux * t1 - vx * wJoin, ny + uy * t1 - vy * wJoin };
+    m.nib[3] = D2D1_POINT_2F{ nx + ux * t1 + vx * wJoin, ny + uy * t1 + vy * wJoin };
+
+    m.body[0] = D2D1_POINT_2F{ nx + ux * t2 - vx * wBody, ny + uy * t2 - vy * wBody };
+    m.body[1] = D2D1_POINT_2F{ nx + ux * t2 + vx * wBody, ny + uy * t2 + vy * wBody };
+    m.body[2] = D2D1_POINT_2F{ nx + ux * t3 + vx * wCap, ny + uy * t3 + vy * wCap };
+    m.body[3] = D2D1_POINT_2F{ nx + ux * t3 - vx * wCap, ny + uy * t3 - vy * wCap };
+
+    const float s0 = b * 0.06f, s1 = b * 0.40f, so = b * 0.26f, sw = b * 0.075f;
+    m.streak[0] = D2D1_POINT_2F{ nx + ux * s0 + vx * (so - sw), ny + uy * s0 + vy * (so - sw) };
+    m.streak[1] = D2D1_POINT_2F{ nx + ux * s1 + vx * (so - sw), ny + uy * s1 + vy * (so - sw) };
+    m.streak[2] = D2D1_POINT_2F{ nx + ux * s1 + vx * (so + sw), ny + uy * s1 + vy * (so + sw) };
+    m.streak[3] = D2D1_POINT_2F{ nx + ux * s0 + vx * (so + sw), ny + uy * s0 + vy * (so + sw) };
 }
 
 inline D2D1_RECT_F R(float x, float y, float w, float h) {
@@ -240,7 +324,7 @@ private:
     }
 
     static bool needs_fill(int g) {
-        return g == G_ARROW || g == G_UNDO || g == G_REDO || g == G_MARKER;
+        return g == G_ARROW || g == G_UNDO || g == G_REDO || g == G_MARKER || g == G_SAVE;
     }
 
     // All glyphs are centred on (cx,cy) inside a box of `b` = glyphSize.
@@ -279,62 +363,69 @@ private:
                 add_ellipse(s, cx, cy, h * 0.92f, h * 0.70f);
                 break;
             case G_MARKER: {
-                // Highlighter: a slanted wide bar with a chisel tip.
-                float w = b * 0.26f;
-                s->BeginFigure(D2D1_POINT_2F{ L + b * 0.12f, B - b * 0.10f }, D2D1_FIGURE_BEGIN_HOLLOW);
-                s->AddLine(D2D1_POINT_2F{ cx + w * 0.5f, cy - b * 0.10f });
-                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.06f, T + b * 0.10f });
-                s->EndFigure(D2D1_FIGURE_END_OPEN);
-                (void)w;
+                // Nib, body and the band it laid. Three separate shapes with a gap between the
+                // nib and the body; that gap plus the band is what stops this from reading as
+                // another slanted line.
+                MarkerShape m;
+                marker_shape(cx, cy, b, m);
+                const D2D1_POINT_2F* parts[3] = { m.nib, m.body, m.streak };
+                for (int i = 0; i < 3; ++i) {
+                    s->BeginFigure(parts[i][0], D2D1_FIGURE_BEGIN_HOLLOW);
+                    s->AddLine(parts[i][1]);
+                    s->AddLine(parts[i][2]);
+                    s->AddLine(parts[i][3]);
+                    s->EndFigure(D2D1_FIGURE_END_CLOSED);
+                }
                 break;
             }
             case G_CROP: {
-                // Crop marks: a vertical stroke whose foot turns right, and a horizontal
-                // stroke whose right end turns down. No diagonal - it read as a letter.
-                s->BeginFigure(D2D1_POINT_2F{ cx - b * 0.17f, T + b * 0.05f }, D2D1_FIGURE_BEGIN_HOLLOW);
-                s->AddLine(D2D1_POINT_2F{ cx - b * 0.17f, B - b * 0.17f });
-                s->AddLine(D2D1_POINT_2F{ cx + b * 0.32f, B - b * 0.17f });
+                // The classic crop marks: a top edge that turns down at its left end and a
+                // bottom edge that turns up at its right end, both running past each other so
+                // the middle reads as a frame and the ends as cut lines.
+                s->BeginFigure(D2D1_POINT_2F{ Rt - b * 0.10f, cy - b * 0.28f }, D2D1_FIGURE_BEGIN_HOLLOW);
+                s->AddLine(D2D1_POINT_2F{ cx - b * 0.28f, cy - b * 0.28f });
+                s->AddLine(D2D1_POINT_2F{ cx - b * 0.28f, B - b * 0.10f });
                 s->EndFigure(D2D1_FIGURE_END_OPEN);
-                s->BeginFigure(D2D1_POINT_2F{ L + b * 0.17f, cy - b * 0.17f }, D2D1_FIGURE_BEGIN_HOLLOW);
-                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.05f, cy - b * 0.17f });
-                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.05f, cy + b * 0.32f });
+                s->BeginFigure(D2D1_POINT_2F{ L + b * 0.10f, cy + b * 0.28f }, D2D1_FIGURE_BEGIN_HOLLOW);
+                s->AddLine(D2D1_POINT_2F{ cx + b * 0.28f, cy + b * 0.28f });
+                s->AddLine(D2D1_POINT_2F{ cx + b * 0.28f, T + b * 0.10f });
                 s->EndFigure(D2D1_FIGURE_END_OPEN);
                 break;
             }
             case G_UNDO:
-            case G_REDO: {
-                float dir = (g == G_UNDO) ? 1.0f : -1.0f;
-                float y0 = cy + b * 0.20f;
-                s->BeginFigure(D2D1_POINT_2F{ cx + dir * b * 0.40f, y0 }, D2D1_FIGURE_BEGIN_HOLLOW);
-                s->AddBezier(D2D1_BEZIER_SEGMENT{
-                    { cx + dir * b * 0.42f, cy - b * 0.30f },
-                    { cx - dir * b * 0.10f, cy - b * 0.42f },
-                    { cx - dir * b * 0.40f, cy - b * 0.06f } });
-                s->EndFigure(D2D1_FIGURE_END_OPEN);
+            case G_REDO:
+                // Tail low on one side, head high on the other: undo sweeps from the right,
+                // up over the top and around to the left (counter-clockwise); redo is the
+                // same shape seen in a mirror. Both get a filled head so the direction of
+                // the curl reads at a glance instead of looking like a random hook.
+                add_arc(s, arc_for(g, cx, cy, b));
                 break;
-            }
             case G_SAVE: {
-                // Down arrow into a tray.
-                s->BeginFigure(D2D1_POINT_2F{ cx, T + b * 0.10f }, D2D1_FIGURE_BEGIN_HOLLOW);
-                s->AddLine(D2D1_POINT_2F{ cx, cy + b * 0.14f });
+                // A tray, and an arrow that visibly enters it: the shaft crosses the tray's
+                // open top and the filled head sits inside the tray.
+                s->BeginFigure(D2D1_POINT_2F{ L + b * 0.10f, cy + b * 0.14f }, D2D1_FIGURE_BEGIN_HOLLOW);
+                s->AddLine(D2D1_POINT_2F{ L + b * 0.10f, B - b * 0.06f });
+                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.10f, B - b * 0.06f });
+                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.10f, cy + b * 0.14f });
                 s->EndFigure(D2D1_FIGURE_END_OPEN);
-                s->BeginFigure(D2D1_POINT_2F{ L + b * 0.12f, cy + b * 0.12f }, D2D1_FIGURE_BEGIN_HOLLOW);
-                s->AddLine(D2D1_POINT_2F{ L + b * 0.12f, B });
-                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.12f, B });
-                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.12f, cy + b * 0.12f });
+                s->BeginFigure(D2D1_POINT_2F{ cx, T + b * 0.08f }, D2D1_FIGURE_BEGIN_HOLLOW);
+                s->AddLine(D2D1_POINT_2F{ cx, cy + b * 0.10f });
                 s->EndFigure(D2D1_FIGURE_END_OPEN);
                 break;
             }
             case G_COPY: {
-                s->BeginFigure(D2D1_POINT_2F{ cx - b * 0.10f, T + b * 0.06f }, D2D1_FIGURE_BEGIN_HOLLOW);
-                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.06f, T + b * 0.06f });
-                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.06f, cy + b * 0.10f });
-                s->AddLine(D2D1_POINT_2F{ cx - b * 0.10f, cy + b * 0.10f });
-                s->EndFigure(D2D1_FIGURE_END_CLOSED);
-                s->BeginFigure(D2D1_POINT_2F{ L + b * 0.06f, cy + b * 0.16f }, D2D1_FIGURE_BEGIN_HOLLOW);
-                s->AddLine(D2D1_POINT_2F{ cx + b * 0.16f, cy + b * 0.16f });
-                s->AddLine(D2D1_POINT_2F{ cx + b * 0.16f, B });
-                s->AddLine(D2D1_POINT_2F{ L + b * 0.06f, B });
+                // Two sheets of the same size, one shifted up and to the right. The sheet in
+                // back is drawn only where it is not covered, so the overlap is visible; two
+                // closed rectangles next to each other read as one box plus an L.
+                s->BeginFigure(D2D1_POINT_2F{ cx - b * 0.16f, cy - b * 0.02f }, D2D1_FIGURE_BEGIN_HOLLOW);
+                s->AddLine(D2D1_POINT_2F{ cx - b * 0.16f, T + b * 0.10f });
+                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.10f, T + b * 0.10f });
+                s->AddLine(D2D1_POINT_2F{ Rt - b * 0.10f, cy + b * 0.20f });
+                s->EndFigure(D2D1_FIGURE_END_OPEN);
+                s->BeginFigure(D2D1_POINT_2F{ L + b * 0.10f, cy - b * 0.02f }, D2D1_FIGURE_BEGIN_HOLLOW);
+                s->AddLine(D2D1_POINT_2F{ cx + b * 0.16f, cy - b * 0.02f });
+                s->AddLine(D2D1_POINT_2F{ cx + b * 0.16f, B - b * 0.10f });
+                s->AddLine(D2D1_POINT_2F{ L + b * 0.10f, B - b * 0.10f });
                 s->EndFigure(D2D1_FIGURE_END_CLOSED);
                 break;
             }
@@ -393,23 +484,29 @@ private:
                 break;
             }
             case G_UNDO:
-            case G_REDO: {
-                float dir = (g == G_UNDO) ? 1.0f : -1.0f;
-                float px = cx + dir * b * 0.40f, py = cy + b * 0.20f;
-                float sz = b * 0.20f;
-                s->BeginFigure(D2D1_POINT_2F{ px, py - sz }, D2D1_FIGURE_BEGIN_FILLED);
-                s->AddLine(D2D1_POINT_2F{ px - dir * sz * 1.1f, py });
-                s->AddLine(D2D1_POINT_2F{ px, py + sz });
-                s->EndFigure(D2D1_FIGURE_END_CLOSED);
+            case G_REDO:
+                add_arc_head(s, arc_for(g, cx, cy, b), b);
+                break;
+            case G_MARKER: {
+                MarkerShape m;
+                marker_shape(cx, cy, b, m);
+                const D2D1_POINT_2F* parts[3] = { m.nib, m.body, m.streak };
+                for (int i = 0; i < 3; ++i) {
+                    s->BeginFigure(parts[i][0], D2D1_FIGURE_BEGIN_FILLED);
+                    s->AddLine(parts[i][1]);
+                    s->AddLine(parts[i][2]);
+                    s->AddLine(parts[i][3]);
+                    s->EndFigure(D2D1_FIGURE_END_CLOSED);
+                }
                 break;
             }
-            case G_MARKER: {
-                // Filled highlighter body.
-                float w = b * 0.30f;
-                s->BeginFigure(D2D1_POINT_2F{ cx - b * 0.40f, cy + b * 0.34f }, D2D1_FIGURE_BEGIN_FILLED);
-                s->AddLine(D2D1_POINT_2F{ cx - b * 0.40f + w, cy + b * 0.34f - w });
-                s->AddLine(D2D1_POINT_2F{ cx + b * 0.16f, cy - b * 0.02f });
-                s->AddLine(D2D1_POINT_2F{ cx - b * 0.24f, cy + b * 0.06f });
+            case G_SAVE: {
+                // Filled arrowhead sitting inside the tray, so the glyph reads as "put the
+                // result somewhere" instead of as an up/down arrow pair.
+                float hw = b * 0.17f;
+                s->BeginFigure(D2D1_POINT_2F{ cx, cy + b * 0.30f }, D2D1_FIGURE_BEGIN_FILLED);
+                s->AddLine(D2D1_POINT_2F{ cx - hw, cy + b * 0.08f });
+                s->AddLine(D2D1_POINT_2F{ cx + hw, cy + b * 0.08f });
                 s->EndFigure(D2D1_FIGURE_END_CLOSED);
                 break;
             }

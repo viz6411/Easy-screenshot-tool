@@ -22,5 +22,8 @@ test-output/
 # keep the UI reference picture in docs
 !docs/*.png
 
+# acceptance artifacts: magnified icon sheets are versioned evidence, not test droppings
+!docs/icons/*.png
+
 # test run logs
 *_run.txt

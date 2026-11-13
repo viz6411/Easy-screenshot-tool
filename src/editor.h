@@ -494,7 +494,7 @@ private:
                     if (!on) c.a = 0.55f;
                     ID2D1SolidColorBrush* ink = nullptr;
                     if (!cv_.brush(c, &ink)) ink = on ? cv_.brAccent : cv_.brMuted;
-                    float half = s.w * 0.26f, cx = s.x + s.w / 2, cy = s.y + s.h / 2;
+                    float half = s.w * 0.34f, cx = s.x + s.w / 2, cy = s.y + s.h / 2;
                     float thick = (1.5f + (float)std::max(1, s.width) * 0.75f) * t.k;
                     rt_->DrawLine(D2D1_POINT_2F{ cx - half, cy }, D2D1_POINT_2F{ cx + half, cy },
                                   ink, thick, cv_.solid);
