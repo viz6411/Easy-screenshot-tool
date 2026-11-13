@@ -1,0 +1,26 @@
+# build output
+*.exe
+*.obj
+*.res
+*.log
+build/
+
+# generated at run time next to the executable
+settings.ini
+
+# test by-products
+*.png
+states.txt
+debug_frame.png
+dbg_editor.log
+
+# local scratch tooling from development sessions
+tests/__pycache__/
+test-output/
+
+
+# keep the UI reference picture in docs
+!docs/*.png
+
+# test run logs
+*_run.txt
