@@ -27,7 +27,6 @@ query($owner: String!, $repo: String!, $number: Int!) {
         nodes {
           __typename
           ... on ProjectV2SingleSelectField { id name options { id name } }
-          ... on ProjectV2StatusField { id name iterations { id name default optionIds } }
         }
       }
     }
@@ -49,8 +48,8 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
           }
           fieldValues(first: 20) {
             nodes {
-              ... on ProjectV2ItemFieldSingleSelectValue { name fieldId field { ... on ProjectV2SingleSelectField { name } } }
-              ... on ProjectV2ItemFieldIterationValue { title fieldId }
+              ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } }
+              ... on ProjectV2ItemFieldIterationValue { title }
             }
           }
         }
@@ -61,11 +60,23 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
 """
 
 MOVE_Q = """
-mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: SingleSelectV2!) {
+mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
   updateProjectV2ItemFieldValue(input: { projectId: $projectId, itemId: $itemId,
     fieldId: $fieldId, value: { singleSelectOptionId: $optionId } }) {
     projectV2Item { id }
   }
+}
+"""
+
+ISSUE_Q = """
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) { issue(number: $number) { id title } }
+}
+"""
+
+ADD_Q = """
+mutation($projectId: ID!, $contentId: ID!) {
+  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) { item { id } }
 }
 """
 
@@ -193,10 +204,22 @@ def fill(milestone_number):
     return 0
 
 
+def add(number):
+    proj, _ = board()
+    issue = gql(ISSUE_Q, owner=OWNER, repo=REPO, number=number)['repository']['issue']
+    if not issue:
+        raise SystemExit('issue #%s does not exist' % number)
+    gql(ADD_Q, projectId=proj['id'], contentId=issue['id'])
+    print('#%s added to the board' % number)
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] == 'report':
         return report()
+    if args[0] == 'add' and len(args) == 2:
+        return add(int(args[1]))
     if args[0] == 'move' and len(args) == 3:
         return move(int(args[1]), args[2])
     if args[0] == 'fill' and len(args) == 2:
