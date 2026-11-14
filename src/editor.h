@@ -250,6 +250,7 @@ private:
             case WM_MOUSEMOVE:  on_move((short)LOWORD(lp), (short)HIWORD(lp)); return 0;
             case WM_LBUTTONUP:   on_up((short)LOWORD(lp), (short)HIWORD(lp)); return 0;
             case WM_KEYDOWN:     on_key((int)wp); return 0;
+            case WM_KEYUP:       on_key_up((int)wp); return 0;
             case WM_CHAR:        on_char((wchar_t)wp); return 0;
 
             case WM_GETMINMAXINFO: {
@@ -1029,12 +1030,11 @@ private:
 
     // Card #6: text is click -> type -> Enter, not drag. The click that places the caret is
     // released long before the first key is typed, so mouse-up must not end the edit.
+    // Card #21: a click while a label is being typed finishes that label and places a NEW one at
+    // the clicked point. Moving the anchor instead (what this did) meant the text being typed
+    // jumped to every new click and a second label was impossible without switching tools.
     void start_text(int mx, int my) {
-        if (text_edit_) {                     // a second click moves the anchor being typed at
-            cur_.pts[0] = { imgX(mx), imgY(my) };
-            InvalidateRect(hwnd_, nullptr, TRUE);
-            return;
-        }
+        if (text_edit_) commit_text();
         text_edit_ = true;
         text_buffer_.clear();
         cur_ = Stroke{ TOOL_TEXT, { { imgX(mx), imgY(my) } }, color_, width_, L"", backdrop_ };
@@ -1138,8 +1138,15 @@ private:
         InvalidateRect(hwnd_, nullptr, TRUE);
     }
 
+    // Ctrl state is read from this window's own key messages. GetKeyState reports the physical
+    // keyboard of whoever owns it, so a Ctrl shortcut could only be produced by injecting keys into
+    // the whole session - which is what made every automated check fight the owner for the keyboard
+    // (card #21). Real presses and posted ones both arrive through this window's queue.
+    void on_key_up(int vk) { if (vk == VK_CONTROL) ctrl_held_ = false; }
+
     void on_key(int vk) {
-        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (vk == VK_CONTROL) { ctrl_held_ = true; return; }
+        bool ctrl = ctrl_held_ || (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         if (text_edit_ && !ctrl) {
             if (vk == VK_RETURN) { commit_text(); return; }
             if (vk == VK_ESCAPE) { cancel_text(); return; }   // Esc closes the text, not the editor
@@ -1375,6 +1382,7 @@ private:
     std::vector<Change> undo_, redo_;          // committed steps, crops included
     Stroke cur_;
     bool drawing_ = false, crop_active_ = false, text_edit_ = false;
+    bool ctrl_held_ = false;                    // Ctrl as this window saw it, not as GetKeyState says
     POINT crop_a_{}, crop_b_{};
     std::wstring text_buffer_;
     int hover_slot_ = -1;
