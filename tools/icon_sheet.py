@@ -49,6 +49,29 @@ def magnify(w, h, rgb, s):
     return ow, oh, out
 
 
+def chip_boxes(fr, pill):
+    """Control boxes along the chip line, read off each control's own top border.
+
+    ui_probe.control_runs() only knows the filled surfaces (control / controlHover / accentFill);
+    the 0.2 pill also has outline-only history chips and canvas-filled output niches, so the box
+    comes from the top border every control draws. Colour swatches are excluded by width: their
+    square is 22*k (38 px at 175 %), a chip is ctlH (56 px).
+    shortcut: relies on the border; if a control ever loses it, take the box from its glyph.
+    """
+    ink = lambda c: not P.near(c, P.FLOATING, 7)
+    best, best_row = [], 0
+    for y in range(pill['y0'] + 1, pill['y1']):
+        found = [(s, e, ln) for s, e, ln in fr.runs(y, ink, pill['x0'], pill['x1'], 1)
+                 if 44 <= ln <= 62]
+        # The chip line is where every one of the thirteen chips shows up: 6 tools, 3 properties,
+        # 2 history, 2 output. Colour swatches (38 px) and their rings stay below the floor.
+        if len(found) >= 13:
+            return found, y
+        if len(found) > len(best):
+            best, best_row = found, y
+    return best, best_row
+
+
 def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'build', 'icon-sheet.png')
     if not os.path.exists(EXE):
@@ -61,28 +84,38 @@ def main():
             print('editor window never appeared'); return 1
         time.sleep(1.2)
 
-        # Draw one stroke so undo and redo become enabled: a disabled control is painted as a
-        # recess and its icon would not show up in the sheet.
-        P.move(900, 800); P.drag(820, 720, 1240, 980, steps=8)
-        time.sleep(0.4)
-
+        # The boxes are read from a fresh window: with no strokes yet every control is recessed and
+        # all thirteen show a border. After a stroke the enabled history control is drawn with no
+        # fill at all, and a borderless chip cannot be measured, so the stroke comes second.
         fr = P.capture_window('ShotMvpEditor')
         pill = P.find_pill(fr)
         if not pill:
             print('pill not found'); return 1
-        runs = P.control_runs(fr, pill)
+        runs, chip_top = chip_boxes(fr, pill)
         if not runs:
             print('no controls found in the pill'); return 1
 
-        top, bottom = pill['y0'] + 6, pill['y1'] - 5
-        tiles = [magnify(*(crop(fr, r[0], top, r[1], bottom)), SCALE) for r in runs]
+        P.move(900, 800); P.drag(820, 720, 1240, 980, steps=8)
+        time.sleep(0.4)
+
+        fr = P.capture_window('ShotMvpEditor')
+        pill2 = P.find_pill(fr)
+        if not pill2:
+            print('pill not found after the stroke'); return 1
+        dx = pill2['x0'] - pill['x0']              # the pill is centred: only a re-centring shifts it
+        # The band stops below the chip square: captions are wider than the chip, and slicing them
+        # at the tile edge would put half a word in every tile. Glyphs only - captions are read in
+        # stage2-pill-2x.png.
+        bottom = chip_top + max(r[2] for r in runs) + 8
+        top = chip_top - 4
+        tiles = [magnify(*(crop(fr, r[0] + dx, top, r[1] + dx, bottom)), SCALE) for r in runs]
 
         cw = max(t[0] for t in tiles)
         ch = max(t[1] for t in tiles)
         rows = (len(tiles) + PER_ROW - 1) // PER_ROW
         W = PER_ROW * cw + (PER_ROW + 1) * GAP
         H = rows * ch + (rows + 1) * GAP
-        sheet = bytearray([0x18, 0x1B, 0x20]) * (W * H * 3)
+        sheet = bytearray([0x18, 0x1B, 0x20]) * (W * H)     # three bytes per pixel
         for n, (tw, th, rgb) in enumerate(tiles):
             row, col = n // PER_ROW, n % PER_ROW
             ox = GAP + col * (cw + GAP)
