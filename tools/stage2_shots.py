@@ -32,9 +32,9 @@ VK_CONTROL, VK_RETURN, VK_ESCAPE = 0x11, 0x0D, 0x1B
 
 
 def ctrl(vk):
-    u.keybd_event(VK_CONTROL, 0, 0, 0); time.sleep(0.06)
-    P.press_key(vk, settle=0.8)
-    u.keybd_event(VK_CONTROL, 0, 2, 0); time.sleep(0.4)
+    """Posted Ctrl+<key> to the editor window - ui_probe drives every control the same way, so the
+    shot harness does not touch the machine's keyboard either."""
+    P.ctrl_key(vk, settle=0.8)
 
 
 WM_CHAR = 0x0102
@@ -43,56 +43,14 @@ u.VkKeyScanW.restype = ctypes.c_short
 
 
 def type_text(s):
-    """Sends each character the way the editor receives it from a keyboard that types it.
-
-    keybd_event with the vk and shift state the machine's current layout uses for the character
-    (VkKeyScanW), so the editor's own key translation produces it.
-    shortcut: a character the active layout has no key for (Cyrillic on a Latin layout) is posted
-    as the WM_CHAR that key would generate - SendInput injection is dropped in this environment.
-    The manual checklist run types the text physically.
-    """
-    hwnd = P.find_window('ShotMvpEditor')[0]
-    for ch in s:
-        sc = u.VkKeyScanW(ch)
-        mods = (sc >> 8) & 0x3F if sc != -1 else 0
-        if sc == -1 or sc == 0xFFFF or mods & ~0x01:
-            u.PostMessageW(hwnd, WM_CHAR, ord(ch), 0x1 | (1 << 24))
-        else:
-            vk, shift = sc & 0xFF, mods & 1
-            scan = u.MapVirtualKeyW(vk, 0)
-            if shift: u.keybd_event(VK_SHIFT, 0, 0, 0); time.sleep(0.03)
-            u.keybd_event(vk, scan, 0, 0); time.sleep(0.03)
-            u.keybd_event(vk, scan, 2, 0)
-            if shift: u.keybd_event(VK_SHIFT, 0, 2, 0); time.sleep(0.03)
-        time.sleep(0.03)
-    time.sleep(0.4)
+    P.type_text(s)
 
 
 
 def window_bits(hwnd):
-    """Renders one window into RGB bytes through PrintWindow (PW_RENDERFULLCONTENT).
-
-    On this machine a screen-DC BitBlt of a region where a shell dialog overlaps another window
-    blends the two window surfaces, while PrintWindow of each window returns its own intact
-    content. The picker shot is therefore assembled from the surfaces themselves.
-    """
-    r = W.RECT(); u.GetWindowRect(hwnd, ctypes.byref(r))
-    w, h = r.right - r.left, r.bottom - r.top
-    if w <= 0 or h <= 0:
-        return None
-    screen = u.GetDC(None)
-    mdc = P.g.CreateCompatibleDC(screen)
-    bmp = P.g.CreateCompatibleBitmap(screen, w, h)
-    old = P.g.SelectObject(mdc, bmp)
-    u.PrintWindow(hwnd, mdc, 2)
-    buf = (ctypes.c_ubyte * (w * h * 4))()
-    P.g.GetBitmapBits(bmp, w * h * 4, buf)
-    rgb = bytearray(w * h * 3)
-    for i in range(w * h):
-        rgb[i * 3:i * 3 + 3] = bytes(buf[i * 4:i * 4 + 3])
-    P.g.SelectObject(mdc, old)
-    P.g.DeleteObject(bmp); P.g.DeleteDC(mdc); u.ReleaseDC(None, screen)
-    return r.left, r.top, w, h, rgb
+    """The window's own pixels - the shared PrintWindow reader in tests/ui_probe.py (window_rgb),
+    kept under this name because the picker shot is assembled from window surfaces."""
+    return P.window_rgb(hwnd)
 
 
 def compose(base, x, y, part):
