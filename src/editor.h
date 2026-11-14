@@ -33,6 +33,17 @@ struct Stroke {
     COLORREF color;
     int width;
     std::wstring text;
+    int backdrop = 0;              // text only: 0 none / 1 light / 2 dark (TOOLBAR-SPEC 8.5)
+};
+
+// A committed step of the edit history. A crop changes the image itself, so it has to carry both
+// sides of itself: undoing a crop without the previous pixels is what made crops un-undoable in 0.1.
+// shortcut: a crop stores two full copies of the image; upgrade if crop history ever gets deep.
+struct Change {
+    bool is_crop = false;
+    Stroke stroke;                 // the stroke that was added (redo side of a stroke change)
+    DIB img_before, img_after;
+    std::vector<Stroke> st_before, st_after;
 };
 
 // Startup trail for the test harness, enabled with SHOTMVP_DEBUG=1. It writes to a file
@@ -75,18 +86,17 @@ public:
         AdjustWindowRectEx(&fr, WS_OVERLAPPEDWINDOW, FALSE, 0);
         int frameW = fr.right - fr.left - 1000;
         int frameH = fr.bottom - fr.top - 1000;
+        frame_w_ = frameW; frame_h_ = frameH;
 
-        build_slots();                        // sizes the pill from the slots that will be drawn
-        int pillH = (int)pill_h_;
+        // Captions are measured through DirectWrite, which needs the text formats, which need the
+        // window; so the first pass sizes the window from the caption-free layout and fit_window()
+        // corrects it once the real caption widths are known.
+        fit_ = FIT_PLAIN_1ROW;
+        labels_ = false;
+        build_slots();
         int scrW = GetSystemMetrics(SM_CXSCREEN), scrH = GetSystemMetrics(SM_CYSCREEN);
-
-        int wantClientW = (std::max)(img_.w + PAD * 2, pill_w_ + theme_.s24);
-        int wantClientH = theme_.s12 + pillH + PAD_TOP + img_.h + PAD_BOTTOM + FOOT_H;
-
-        int w = (std::min)(wantClientW + frameW, scrW - 8);
-        int h = (std::min)(wantClientH + frameH, scrH - 8);
-        if (w < 420 + frameW) w = (std::min)(420 + frameW, scrW - 8);
-        if (h < 300 + frameH) h = (std::min)(300 + frameH, scrH - 8);
+        int w = (std::min)((std::max)(img_.w + PAD * 2, pill_w_ + theme_.s24) + frameW, scrW - 8);
+        int h = 300 + frameH;
 
         int px = (std::max)(0, (scrW - w) / 2), py = (std::max)(0, (scrH - h) / 2);
 
@@ -100,6 +110,7 @@ public:
             DestroyWindow(hwnd_); hwnd_ = nullptr;
             return false;
         }
+        fit_window(scrW, scrH, frameW, frameH);
 
         ShowWindow(hwnd_, SW_SHOW);
         UpdateWindow(hwnd_);
@@ -129,43 +140,73 @@ public:
         dbg("run: message loop exited");
         shutdown_d2d();
         DestroyWindow(hwnd_); hwnd_ = nullptr;
-        return saved_;
+        return produced_;
     }
+
+    // Output happens while the editor is open (card #8): neither action closes the window, and the
+    // owner supplies the file/clipboard work because it owns settings.ini.
+    enum OutputResult { OUT_SAVED = 0, OUT_CANCELLED, OUT_FAILED };
+    using SaveFn = OutputResult (*)(const DIB& img, HWND owner, std::wstring& path_out);
+    using CopyFn = bool (*)(const DIB& img);
+    void set_output(SaveFn s, CopyFn c) { save_fn_ = s; copy_fn_ = c; }
+
+    bool produced() const { return produced_; }
 
     // Bake committed strokes into the image so the saved PNG contains them (image-space px).
     DIB compose_result() {
         DIB out = img_;
-        for (auto& s : undo_) draw_stroke_img(out, s);
+        for (auto& s : strokes_) draw_stroke_img(out, s);
         return out;
     }
 
-    bool saved() const { return saved_; }
-    bool copy_requested() const { return copy_requested_; }
-
 private:
     // ---- slot model --------------------------------------------------------------------
-    enum Kind { KIND_TOOL, KIND_COLOR, KIND_WIDTH, KIND_ACTION, KIND_SEP };
+    enum Kind { KIND_TOOL, KIND_COLOR, KIND_WIDTH, KIND_BACKDROP, KIND_ACTION, KIND_SEP };
+    enum Group { GRP_TOOLS = 0, GRP_COLORS, GRP_PROPS, GRP_HISTORY, GRP_OUTPUT, GRP_COUNT };
 
     struct Slot {
         Kind kind = KIND_SEP;
-        int id = 0;              // index within its group
+        Group group = GRP_TOOLS;
+        int row = 0;               // the pill can carry the same groups on two rows
+        int id = 0;                // index within its group
         Tool tool = TOOL_ARROW;
         COLORREF color = 0;
-        int width = 0;
-        int action = -1;         // 0 undo, 1 redo, 2 copy, 3 save
+        int width = 0;             // KIND_WIDTH, or backdrop mode 0 none / 1 light / 2 dark
+        int action = -1;           // 0 undo, 1 redo, 2 copy, 3 save
         int glyph = 0;
-        float x = 0, y = 0, w = 0, h = 0;   // physical px in client space
+        std::wstring caption;      // empty = glyph only
+        float x = 0, y = 0, w = 0, h = 0;   // physical px in client space (the whole cell)
     };
 
     int PAD = 16, PAD_TOP = 8, PAD_BOTTOM = 12, FOOT_H = 26;
     int pill_w_ = 0;
     float pill_x_ = 0, pill_y_ = 0, pill_h_ = 0;
     std::vector<Slot> slots_;
+    std::wstring group_caption_[GRP_COUNT];
+    float grp_x_[2][GRP_COUNT] = {};      // left edge of a group on a row, -1 when absent
+    float grp_w_[2][GRP_COUNT] = {};
+
+    // Fit levels, richest first: labels on one row, labels wrapped to two rows, then the same
+    // without captions. Every level is measured from the real client width, so the pill adapts
+    // to the monitor instead of assuming a 2560-wide calibrated display.
+    enum Fit { FIT_LABELS_1ROW = 0, FIT_LABELS_2ROW, FIT_PLAIN_1ROW, FIT_PLAIN_2ROW };
+    Fit fit_ = FIT_LABELS_1ROW;
+    float fit_w_[4] = { 0, 0, 0, 0 };
+    int pill_min_ = 0;
+    bool labels_ = true;
 
     void apply_metric_padding() {
-        PAD = theme_.s16; PAD_TOP = theme_.s12; PAD_BOTTOM = theme_.s12;
-        FOOT_H = theme_.s24;
+        PAD = theme_.s16; PAD_TOP = theme_.s12;
+        // Card #9: the gap under the image is one constant (PAD_BOTTOM), the separator is the
+        // top edge of the strip, and the strip is tall enough to hold a whole caption line.
+        PAD_BOTTOM = theme_.s16;
+        FOOT_H = 2 * theme_.s6 + caption_line();
     }
+
+    int caption_line() const { return theme_.fsCaption * 4 / 3; }
+    int cell_h() const { return labels_ ? theme_.ctlH + theme_.s4 + caption_line() : theme_.ctlH; }
+    int rows_() const { return (fit_ == FIT_LABELS_2ROW || fit_ == FIT_PLAIN_2ROW) ? 2 : 1; }
+    static bool fit_has_labels(int f) { return f <= FIT_LABELS_2ROW; }
 
     // ---- messages ----------------------------------------------------------------------
     LRESULT on_msg(HWND h, UINT m, WPARAM wp, LPARAM lp) {
@@ -197,8 +238,7 @@ private:
             case WM_SIZE: {
                 int cw = (int)LOWORD(lp), ch = (int)HIWORD(lp);
                 if (rt_ && cw > 0 && ch > 0) {
-                    D2D1_SIZE_U sz = { (UINT32)cw, (UINT32)ch };
-                    rt_->Resize(&sz);
+                    bind_dc();                         // the target follows the new DIB, no swap chain
                     cv_.clear_cache();                // glyph geometry depends on slot positions
                     layout();
                     InvalidateRect(h, nullptr, TRUE);
@@ -214,7 +254,12 @@ private:
 
             case WM_GETMINMAXINFO: {
                 MINMAXINFO* mmi = (MINMAXINFO*)lp;
-                mmi->ptMinTrackSize.x = (LONG)(pill_w_ + theme_.s24 + 16);
+                // The floor is the narrowest pill the layout can produce (level 4), never the pill
+                // of the current level: flooring it at the labelled width would forbid a window
+                // 2189 px wide and make the two-row level unreachable (8.1 p.4).
+                int pill_floor = pill_min_ ? pill_min_ : pill_w_;
+                mmi->ptMinTrackSize.x = (std::max)(420 + frame_w_,
+                                                   (pill_floor + theme_.s24 + 16) + frame_w_);
                 mmi->ptMinTrackSize.y = 240;
                 return 0;
             }
@@ -249,18 +294,19 @@ private:
         D2D1_RENDER_TARGET_PROPERTIES rp = {};
         rp.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
         rp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        rp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+        rp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;   // the DIB section we draw into is opaque
         rp.dpiX = 96.0f; rp.dpiY = 96.0f;            // sizes are pre-scaled by the theme
         rp.usage = D2D1_RENDER_TARGET_USAGE_NONE;
 
-        D2D1_HWND_RENDER_TARGET_PROPERTIES hp = {};
-        hp.hwnd = hwnd_;
-        hp.pixelSize.width = (UINT32)(cr.right - cr.left);
-        hp.pixelSize.height = (UINT32)(cr.bottom - cr.top);
-        hp.presentOptions = D2D1_PRESENT_OPTIONS_NONE;
-
-        hr = factory_->CreateHwndRenderTarget(&rp, &hp, &rt_);
-        if (FAILED(hr)) { dbg("init: CreateHwndRenderTarget", hr); return false; }
+        // Drawing goes to a DIB section that is copied into the window, not to a DXGI swap chain.
+        // The swap chain path presented nothing on this machine (hybrid iGPU/dGPU with the dGPU
+        // busy): the window stayed white while all the drawing calls succeeded. A layered window
+        // with a DIB (the selection overlay) composites fine, so the editor uses the same route.
+        ID2D1DCRenderTarget* dc = nullptr;
+        hr = factory_->CreateDCRenderTarget(&rp, &dc);
+        if (FAILED(hr)) { dbg("init: CreateDCRenderTarget", hr); return false; }
+        rt_ = dc;
+        bind_dc();
 
         hr = cv_.init(rt_, factory_, dwrite_, &theme_);
         dbg("init: canvas resources", hr);
@@ -275,8 +321,34 @@ private:
         cv_.shutdown();
         if (img_bitmap_) { img_bitmap_->Release(); img_bitmap_ = nullptr; }
         if (rt_) { rt_->Release(); rt_ = nullptr; }
+        if (memdc_) { DeleteDC(memdc_); memdc_ = nullptr; }
+        if (dib_) { DeleteObject(dib_); dib_ = nullptr; }
         if (dwrite_) { dwrite_->Release(); dwrite_ = nullptr; }
         if (factory_) { factory_->Release(); factory_ = nullptr; }
+    }
+
+    // The D2D target is bound to a top-down 32 bpp DIB in a memory DC; paint() copies that DIB
+    // into the window. Resizing means a new DIB and a new BindDC, never a swap chain resize.
+    void bind_dc() {
+        RECT cr; GetClientRect(hwnd_, &cr);
+        int w = cr.right - cr.left, h = cr.bottom - cr.top;
+        if (!rt_ || w <= 0 || h <= 0) return;
+        if (memdc_) { DeleteDC(memdc_); memdc_ = nullptr; }
+        if (dib_) { DeleteObject(dib_); dib_ = nullptr; }
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;   // negative: top-down rows
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HDC screen = GetDC(hwnd_);
+        memdc_ = CreateCompatibleDC(screen);
+        dib_ = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        ReleaseDC(hwnd_, screen);
+        if (!memdc_ || !dib_) { dbg("bind: dib section failed"); return; }
+        SelectObject(memdc_, dib_);
+        RECT area = { 0, 0, w, h };
+        HRESULT bhr = ((ID2D1DCRenderTarget*)rt_)->BindDC(memdc_, &area);
+        if (FAILED(bhr)) dbg("bind: BindDC failed", bhr);
     }
 
     void refresh_image_bitmap() {
@@ -306,49 +378,208 @@ private:
     }
 
     // ---- pill geometry --------------------------------------------------------------------
-    // build_slots() is the only place the toolbar's structure exists. It lays the slots out
-    // relative to x=0 and only then measures the run, so the pill can never be narrower than
-    // what is drawn on it. The previous version reserved room for "three separators" while the
-    // loop emitted four, and the Save icon ended up hanging outside the pill.
-    void build_slots() {
-        slots_.clear();
+    // build_slots() is the only place the toolbar's structure exists. Groups are measured first
+    // (captions through IDWrite metrics, never through a guessed character width), then placed, so
+    // the pill can never be narrower than what is drawn on it and the Save control can never
+    // hang outside it again.
+    struct Grp {
+        Group id = GRP_TOOLS;
+        Kind kind = KIND_TOOL;
+        float cell = 0, gap = 0, content = 0;
+        std::vector<Slot> slots;
+    };
+
+    static const wchar_t* tool_caption(int i) {
+        static const wchar_t* c[6] = { L"Стрелка", L"Текст", L"Прямоугольник",
+                                       L"Овал", L"Маркер", L"Кадрирование" };
+        return c[i];
+    }
+    static const wchar_t* output_caption(int i) {
+        static const wchar_t* c[2] = { L"Копировать", L"Сохранить" };
+        return c[i];
+    }
+
+    std::vector<Grp> build_groups(bool with_labels) {
         const Theme& t = theme_;
-        float x = 0, top = 0;
-        const float csize = (float)t.ctlH;
-        pill_h_ = (float)(t.ctlH + t.s6 * 2);
-
-        auto push = [&](Kind kind, int id, int glyph, Tool tool, COLORREF col, int width, int action) {
-            Slot s; s.kind = kind; s.id = id; s.glyph = glyph; s.tool = tool;
-            s.color = col; s.width = width; s.action = action;
-            s.x = x; s.y = top; s.w = csize; s.h = csize;
-            slots_.push_back(s);
-            x += csize + (float)t.s2;
-        };
-        auto sep = [&]() {
-            x += t.s8;
-            Slot s; s.kind = KIND_SEP; s.x = x - t.s4 - 1.0f; s.y = top;
-            s.w = 1.0f; s.h = pill_h_ - t.s6 * 2;
-            slots_.push_back(s);
-            x += t.s8;
-        };
-
         const int glyphs[6] = { ui::G_ARROW, ui::G_TEXT, ui::G_RECT, ui::G_ELLIPSE, ui::G_MARKER, ui::G_CROP };
         const Tool tools[6] = { TOOL_ARROW, TOOL_TEXT, TOOL_RECT, TOOL_ELLIPSE, TOOL_MARKER, TOOL_CROP };
-        for (int i = 0; i < 6; ++i) {
-            push(KIND_TOOL, i, glyphs[i], tools[i], 0, 0, -1);
-            if (i == 3) sep();                     // shapes | freehand and crop
-        }
-        sep();                                     // tools | colours
-        for (int i = 0; i < (int)palette_.size(); ++i) push(KIND_COLOR, i, -1, TOOL_ARROW, palette_[i], 0, -1);
-        sep();                                     // colours | line widths
-        for (int i = 0; i < (int)widths_.size(); ++i) push(KIND_WIDTH, i, -1, TOOL_ARROW, 0, widths_[i], -1);
-        sep();                                     // widths | actions
-        const int acts[4] = { ui::G_UNDO, ui::G_REDO, ui::G_COPY, ui::G_SAVE };
-        for (int i = 0; i < 4; ++i) push(KIND_ACTION, i, acts[i], TOOL_ARROW, 0, 0, i);
+        const int acts[2] = { 2, 3 };                       // copy, save (undo/redo are their own group)
 
-        float right = 0;
-        for (auto& s : slots_) right = (std::max)(right, s.x + s.w);
-        pill_w_ = (int)(right + 2 * t.s12);        // the run plus inner padding on both sides
+        // The widest measured caption sets the cell for its whole group: every cell in a group is
+        // the same width, so the pitch stays uniform and a caption can never push its neighbours.
+        float tool_cap = 0, out_cap = 0;
+        if (with_labels) {
+            for (int i = 0; i < 6; ++i) tool_cap = (std::max)(tool_cap, cv_.measure(tool_caption(i), cv_.fmtCaption));
+            for (int i = 0; i < 2; ++i) out_cap = (std::max)(out_cap, cv_.measure(output_caption(i), cv_.fmtCaption));
+        }
+
+        std::vector<Grp> gs(GRP_COUNT);
+        auto mk = [&](Group g, Kind kind, float cell, float gap) {
+            Grp& gr = gs[g]; gr.id = g; gr.kind = kind; gr.cell = cell; gr.gap = gap;
+            return &gr;
+        };
+        auto add = [&](Grp& gr, int id, int glyph, Tool tool, COLORREF col, int val, int action,
+                       const wchar_t* cap) {
+            Slot s; s.kind = gr.kind; s.group = gr.id; s.id = id; s.glyph = glyph; s.tool = tool;
+            s.color = col; s.width = val; s.action = action;
+            if (cap) s.caption = cap;
+            gr.slots.push_back(s);
+        };
+
+        // Level 3 (no captions) restores the 0.1 geometry exactly: every cell is ctlH wide with an
+        // s2 gap, which is what makes the plain pill measure the same 1350 px it did in 0.1.
+        Grp* tg = mk(GRP_TOOLS, KIND_TOOL, with_labels ? tool_cap + 2.0f * t.s4 : (float)t.ctlH,
+                     with_labels ? (float)t.s6 : (float)t.s2);
+        for (int i = 0; i < 6; ++i) add(*tg, i, glyphs[i], tools[i], 0, 0, -1, with_labels ? tool_caption(i) : nullptr);
+
+        Grp* cg = mk(GRP_COLORS, KIND_COLOR, (float)t.ctlH, (float)t.s2);
+        for (int i = 0; i < (int)palette_.size(); ++i) add(*cg, i, -1, TOOL_ARROW, palette_[i], 0, -1, nullptr);
+
+        // Card #7: with the text tool this group carries the three backdrop states instead of the
+        // three line widths - same cells, same gap, same separators, so the pill never resizes
+        // when the tool changes.
+        bool props_backdrop = (tool_ == TOOL_TEXT);
+        Grp* pg = mk(GRP_PROPS, props_backdrop ? KIND_BACKDROP : KIND_WIDTH, (float)t.ctlH, (float)t.s2);
+        for (int i = 0; i < (int)widths_.size(); ++i)
+            add(*pg, i, -1, TOOL_ARROW, 0, props_backdrop ? i : widths_[i], -1, nullptr);
+
+        Grp* hg = mk(GRP_HISTORY, KIND_ACTION, (float)t.ctlH, (float)t.s2);
+        add(*hg, 0, ui::G_UNDO, TOOL_ARROW, 0, 0, 0, nullptr);
+        add(*hg, 1, ui::G_REDO, TOOL_ARROW, 0, 0, 1, nullptr);
+
+        Grp* og = mk(GRP_OUTPUT, KIND_ACTION, with_labels ? out_cap + 2.0f * t.s4 : (float)t.ctlH,
+                     with_labels ? (float)t.s6 : (float)t.s2);
+        add(*og, 2, ui::G_COPY, TOOL_ARROW, 0, 0, acts[0], with_labels ? output_caption(0) : nullptr);
+        add(*og, 3, ui::G_SAVE, TOOL_ARROW, 0, 0, acts[1], with_labels ? output_caption(1) : nullptr);
+
+        group_caption_[GRP_TOOLS] = L"";
+        group_caption_[GRP_COLORS] = with_labels ? L"Цвет" : L"";
+        group_caption_[GRP_PROPS] = with_labels
+            ? (tool_ == TOOL_TEXT ? L"Фон" : L"Толщина") : L"";
+        group_caption_[GRP_HISTORY] = L"";
+        group_caption_[GRP_OUTPUT] = L"";
+
+        for (auto& gr : gs) {
+            int n = (int)gr.slots.size();
+            gr.content = n * gr.cell + (n > 0 ? (n - 1) : 0) * gr.gap;
+        }
+        return gs;
+    }
+
+    float row_width(const std::vector<Grp>& gs, int from, int to) const {
+        float w = 0;
+        for (int i = from; i <= to; ++i) {
+            if (i > from) w += gs[i - 1].gap + 2.0f * theme_.s8;   // the separator sits in this gap
+            w += gs[i].content;
+        }
+        return w;
+    }
+
+    // The split that makes the wider of the two rows as short as possible.
+    int best_split(const std::vector<Grp>& gs) const {
+        int best = 1;
+        float bestMax = 1e9f;
+        for (int b = 0; b < GRP_COUNT - 1; ++b) {
+            float a = row_width(gs, 0, b), c = row_width(gs, b + 1, GRP_COUNT - 1);
+            float m = (std::max)(a, c);
+            if (m < bestMax) { bestMax = m; best = b; }
+        }
+        return best;
+    }
+
+    float pill_width_for(const std::vector<Grp>& gs, int split, bool two_rows) const {
+        float pad = 2.0f * theme_.s12;
+        if (!two_rows) return row_width(gs, 0, GRP_COUNT - 1) + pad;
+        return (std::max)(row_width(gs, 0, split), row_width(gs, split + 1, GRP_COUNT - 1)) + pad;
+    }
+
+    // Measures all four layouts. Needs the text formats, so it runs after the D2D target exists.
+    void measure_fits() {
+        for (int f = 0; f < 4; ++f) {
+            std::vector<Grp> gs = build_groups(fit_has_labels(f));
+            fit_w_[f] = pill_width_for(gs, best_split(gs), f == FIT_LABELS_2ROW || f == FIT_PLAIN_2ROW);
+        }
+        pill_min_ = (int)fit_w_[FIT_PLAIN_2ROW];
+    }
+
+    Fit fit_for(int client_w) const {
+        for (int f = 0; f < 4; ++f)
+            if (fit_w_[f] + 2.0f * theme_.s8 <= (float)client_w) return (Fit)f;
+        return FIT_PLAIN_2ROW;      // nothing fits: draw the narrowest layout and let the window
+                                    // min-track size stop the user from shrinking it further
+    }
+
+    int pill_h_for(int f) const {
+        int rows = (f == FIT_LABELS_2ROW || f == FIT_PLAIN_2ROW) ? 2 : 1;
+        int cell = fit_has_labels(f) ? theme_.ctlH + theme_.s4 + caption_line() : theme_.ctlH;
+        return rows * cell + (rows + 1) * theme_.s6;
+    }
+
+    // Sizes the window from the measured pill: the richest layout that still fits on this screen
+    // (TOOLBAR-SPEC 8.1 levels 1-3). Nothing here is tied to a particular monitor - the levels are
+    // compared against the client width the screen actually allows.
+    void fit_window(int scrW, int scrH, int frameW, int frameH) {
+        measure_fits();
+        int chosen = FIT_PLAIN_2ROW;
+        for (int f = 0; f < 4; ++f) {
+            int wantClientW = (std::max)(img_.w + 2 * PAD, (int)fit_w_[f] + theme_.s24);
+            int winW = (std::min)(wantClientW + frameW, scrW - 8);
+            if ((int)fit_w_[f] + 2 * theme_.s8 <= winW - frameW) { chosen = f; break; }
+        }
+        fit_ = (Fit)chosen; labels_ = fit_has_labels(chosen); build_slots();
+
+        int wantClientH = theme_.s12 + pill_h_for(chosen) + PAD_TOP + img_.h + PAD_BOTTOM + FOOT_H;
+        int w = (std::min)((std::max)(img_.w + 2 * PAD, pill_w_ + theme_.s24) + frameW, scrW - 8);
+        int h = (std::min)(wantClientH + frameH, scrH - 8);
+        if (w < 420 + frameW) w = (std::min)(420 + frameW, scrW - 8);
+        if (h < 300 + frameH) h = (std::min)(300 + frameH, scrH - 8);
+
+        int px = (std::max)(0, (scrW - w) / 2), py = (std::max)(0, (scrH - h) / 2);
+        SetWindowPos(hwnd_, nullptr, px, py, w, h, SWP_NOZORDER | SWP_FRAMECHANGED);
+        layout();
+        dbg("fit_window applied");
+    }
+
+    void build_slots() {
+        slots_.clear();
+        labels_ = fit_has_labels(fit_);
+        bool two = rows_() == 2;
+        std::vector<Grp> gs = build_groups(labels_);
+        int split = best_split(gs);
+        pill_w_ = (int)(pill_width_for(gs, split, two) + 0.5f);
+        pill_h_ = (float)(rows_() * cell_h() + (rows_() + 1) * theme_.s6);
+
+        const float cellH = (float)cell_h();
+        for (int r = 0; r < 2; ++r) for (int g = 0; g < GRP_COUNT; ++g) grp_x_[r][g] = -1.0f;
+        for (int r = 0; r < (two ? 2 : 1); ++r) {
+            // One row carries every group; only the two-row level uses the split point.
+            int from = r == 0 ? 0 : split + 1;
+            int to = two ? (r == 0 ? split : GRP_COUNT - 1) : GRP_COUNT - 1;
+            float span = row_width(gs, from, to);
+            float x = (pill_w_ - span) / 2.0f;              // each row is centred in the pill
+            float rowTop = (float)(r * (cell_h() + theme_.s6));
+            for (int i = from; i <= to; ++i) {
+                if (i > from) {
+                    Slot s; s.kind = KIND_SEP; s.group = gs[i].id; s.row = r;
+                    s.x = x + gs[i - 1].gap / 2.0f + theme_.s8;
+                    s.y = rowTop; s.w = 1.0f; s.h = cellH;
+                    slots_.push_back(s);
+                    x += gs[i - 1].gap + 2.0f * theme_.s8;
+                }
+                float groupStart = x;
+                for (auto& sl : gs[i].slots) {
+                    sl.row = r;
+                    sl.x = x;
+                    sl.y = rowTop;
+                    sl.w = gs[i].cell;
+                    sl.h = cellH;
+                    slots_.push_back(sl);
+                    x += gs[i].cell + gs[i].gap;
+                }
+                grp_x_[r][gs[i].id] = groupStart;
+                grp_w_[r][gs[i].id] = gs[i].content;
+            }
+        }
     }
 
     void layout() {
@@ -357,11 +588,22 @@ private:
         int cw = cr.right - cr.left;
         const Theme& t = theme_;
 
-        build_slots();
-        if (pill_w_ > cw - 2 * t.s8) pill_w_ = cw - 2 * t.s8;   // never wider than the client
+        fit_ = fit_for(cw);
+        labels_ = fit_has_labels(fit_);
+        build_slots();                          // rows are already centred inside the pill
         pill_x_ = (float)((cw - pill_w_) / 2);
         pill_y_ = (float)t.s12;
-        for (auto& s : slots_) { s.x += pill_x_ + t.s12; s.y += pill_y_ + t.s6; }
+        for (auto& s : slots_) { s.x += pill_x_; s.y += pill_y_ + t.s6; }
+    }
+
+    // The property group belongs to the tool: line widths for a stroke, the three backdrops for
+    // text. Choosing another tool rebuilds the pill, so its controls are the ones that tool has.
+    void set_tool(Tool tl) {
+        if (tl == tool_) return;
+        if (text_edit_) commit_text();
+        tool_ = tl;
+        layout();
+        InvalidateRect(hwnd_, nullptr, TRUE);
     }
 
     // ---- painting ----------------------------------------------------------------------
@@ -391,8 +633,9 @@ private:
         }
 
         // 2. Annotations as geometry, so the preview on screen matches what gets exported.
-        for (auto& s : undo_) paint_stroke(s);
+        for (auto& s : strokes_) paint_stroke(s);
         if (drawing_) paint_stroke(cur_);
+        if (text_edit_) paint_text(cur_, text_buffer_, true);
         if (crop_active_) {
             D2D1_ROUNDED_RECT rr = cv_.R2rr((std::min)(crop_a_.x, crop_b_.x) + img_org_x_,
                                             (std::min)(crop_a_.y, crop_b_.y) + img_org_y_,
@@ -404,22 +647,33 @@ private:
         // 3. The pill.
         paint_pill();
 
-        // 4. Status strip: dimensions then the shortcut hint, deliberately quiet.
+        // 4. Status strip: its top edge IS the separator (card #9), the image bottom sits
+        //    PAD_BOTTOM above it, and every string of the strip lies below it.
         float stripY = H - (float)FOOT_H;
-        rt_->DrawLine(D2D1_POINT_2F{ (float)t.s16, stripY - (float)t.s8 },
-                      D2D1_POINT_2F{ W - (float)t.s16, stripY - (float)t.s8 }, cv_.brSoft);
-        if (cv_.fmtCaption && cv_.brMuted) {
+        rt_->DrawLine(D2D1_POINT_2F{ (float)t.s16, stripY },
+                      D2D1_POINT_2F{ W - (float)t.s16, stripY }, cv_.brSoft);
+        if (cv_.fmtCaption) {
+            float ty = stripY + (float)t.s6, th = (float)(FOOT_H - 2 * t.s6);
             wchar_t buf[96];
-            wsprintfW(buf, L"%d \x00D7 %d", img_.w, img_.h);
-            D2D1_RECT_F fr = ui::R((float)t.s16, stripY, 200, (float)FOOT_H);
-            rt_->DrawText(buf, (UINT)wcslen(buf), cv_.fmtCaption, &fr, cv_.brMuted,
-                          D2D1_DRAW_TEXT_OPTIONS_NONE);
+            wsprintfW(buf, L"%d \x00D7 %d px", img_.w, img_.h);
+            cv_.draw_layout(buf, cv_.fmtCaption, (float)t.s16, ty, 200.0f, th, cv_.brMuted,
+                            DWRITE_TEXT_ALIGNMENT_LEADING);
 
-            const wchar_t* hint = L"1-6 \x0438\x043D\x0441\x0442\x0440\x0443\x043C\x0435\x043D\x0442\x044B   "
-                                  L"Ctrl+Z   Ctrl+Y   Ctrl+S   Ctrl+C   Esc";
-            D2D1_RECT_F hr = ui::R((float)t.s16 + 210.0f, stripY, W - 240.0f, (float)FOOT_H);
-            rt_->DrawText(hint, (UINT)wcslen(hint), cv_.fmtCaption, &hr, cv_.brMuted,
-                          D2D1_DRAW_TEXT_OPTIONS_NONE);
+            // Output confirmations live here (card #8): the editor stays open, so the only place
+            // the result can be announced is this line.
+            const wchar_t* msg = status_msg_.empty() ? nullptr : status_msg_.c_str();
+            ID2D1SolidColorBrush* mb = cv_.brSecondary;   // 8.7 case 2: the path reads as textSecondary
+            if (msg && status_bad_) mb = cv_.brAccent;
+            if (msg) {
+                float mw = cv_.measure(msg, cv_.fmtCaption);
+                cv_.draw_layout(msg, cv_.fmtCaption, (std::max)((float)t.s16 + 210.0f, W - (float)t.s16 - mw),
+                                ty, mw + 1.0f, th, mb, DWRITE_TEXT_ALIGNMENT_LEADING);
+            } else {
+                const wchar_t* hint = L"1-6 \x0438\x043D\x0441\x0442\x0440\x0443\x043C\x0435\x043D\x0442\x044B   "
+                                      L"Ctrl+Z   Ctrl+Y   Ctrl+S   Ctrl+C   Esc";
+                cv_.draw_layout(hint, cv_.fmtCaption, (float)t.s16 + 210.0f, ty,
+                                W - 240.0f, th, cv_.brMuted, DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
         }
 
         HRESULT hr = rt_->EndDraw();
@@ -427,6 +681,23 @@ private:
             dbg("paint: EndDraw failed", hr);
             wprintf(L"EndDraw failed hr=0x%08X\n", (unsigned)hr);
         }
+        if (memdc_ && dib_) {                 // the drawn frame reaches the window as a GDI blit
+            RECT cr; GetClientRect(hwnd_, &cr);
+            HDC hdc = GetDC(hwnd_);
+            BitBlt(hdc, 0, 0, cr.right, cr.bottom, memdc_, 0, 0, SRCCOPY);
+            ReleaseDC(hwnd_, hdc);
+        }
+    }
+
+    // The chip is the only filled surface of a control (8.1): ctlH x ctlH, centred horizontally in
+    // the cell and sitting in the top ctlH pixels of it. The glyph centres on the chip, never on
+    // the cell - otherwise a 153 px signed cell would push its icon 48 px away from its caption.
+    float chip_x(const Slot& s) const { return s.x + (s.w - theme_.ctlH) / 2.0f; }
+
+    ui::ControlGroup group_of(const Slot& s) const {
+        if (s.group == GRP_HISTORY) return ui::CG_PLAIN;    // pill surface + bright outline
+        if (s.group == GRP_OUTPUT)  return ui::CG_SUNKEN;   // canvas recess
+        return ui::CG_TOOL;                                 // tools, colours, properties
     }
 
     void paint_pill() {
@@ -435,26 +706,36 @@ private:
         rt_->FillRoundedRectangle(&pr, cv_.brSurface);
         rt_->DrawRoundedRectangle(&pr, cv_.brBorder, 1.0f, cv_.solid);
 
+        const float capH = (float)caption_line();
+        ID2D1SolidColorBrush* brCap = nullptr;
+        cv_.brush(t.textSecondary, &brCap);
+
         for (auto& s : slots_) {
+            const float cx = chip_x(s);
+            ID2D1SolidColorBrush* cap_br = brCap;
             switch (s.kind) {
                 case KIND_SEP:
-                    rt_->DrawLine(D2D1_POINT_2F{ s.x, pill_y_ + t.s6 },
-                                  D2D1_POINT_2F{ s.x, pill_y_ + pill_h_ - t.s6 }, cv_.brSoft);
-                    break;
+                    rt_->DrawLine(D2D1_POINT_2F{ s.x, s.y }, D2D1_POINT_2F{ s.x, s.y + s.h }, cv_.brSoft);
+                    continue;
 
                 case KIND_TOOL: {
                     bool on = (s.tool == tool_);
                     ui::ControlState st = on ? ui::ST_ACTIVE : state_of(s);
-                    cv_.control(s.x, s.y, s.w, s.h, st);
-                    cv_.glyph(s.glyph, s.id + 1, s.x + s.w / 2, s.y + s.h / 2, st);
+                    cv_.control(cx, s.y, (float)t.ctlH, (float)t.ctlH, st, group_of(s));
+                    cv_.glyph(s.glyph, s.id + 1, cx + t.ctlH / 2.0f, s.y + t.ctlH / 2.0f, st, cv_.brAccent);
+                    if (on || st == ui::ST_HOVER) cap_br = cv_.brText;
                     break;
                 }
 
                 case KIND_ACTION: {
                     bool off = (s.action == 0 && undo_.empty()) || (s.action == 1 && redo_.empty());
                     ui::ControlState st = off ? ui::ST_DISABLED : state_of(s);
-                    cv_.control(s.x, s.y, s.w, s.h, st);
-                    cv_.glyph(s.glyph, s.id + 9, s.x + s.w / 2, s.y + s.h / 2, st);
+                    cv_.control(cx, s.y, (float)t.ctlH, (float)t.ctlH, st, group_of(s));
+                    // History has no accent state, but its resting glyph is the accent (8.2); output
+                    // is neutral in every state - its ink is text, never the accent.
+                    ID2D1SolidColorBrush* rest = (s.group == GRP_HISTORY) ? cv_.brAccent : cv_.brText;
+                    cv_.glyph(s.glyph, s.id + 9, cx + t.ctlH / 2.0f, s.y + t.ctlH / 2.0f, st, rest);
+                    if (st == ui::ST_HOVER) cap_br = cv_.brText;
                     break;
                 }
 
@@ -463,9 +744,11 @@ private:
                     bool hov = (hover_slot_ == slot_index(s));
                     ID2D1SolidColorBrush* cb = nullptr;
                     if (!cv_.brush(col2(s.color), &cb)) break;
-                    if (hov || on) cv_.control(s.x, s.y, s.w, s.h, hov && !on ? ui::ST_HOVER : ui::ST_ACTIVE);
+                    // 8.2: a colour control has no chip at rest and no accent state - the selected
+                    // colour is the ring around the swatch. The chip appears only under the pointer.
+                    if (hov) cv_.control(cx, s.y, (float)t.ctlH, (float)t.ctlH, ui::ST_HOVER, ui::CG_PLAIN);
                     float side = 22.0f * t.k;
-                    float sx = s.x + (s.w - side) / 2.0f, sy = s.y + (s.h - side) / 2.0f;
+                    float sx = cx + (t.ctlH - side) / 2.0f, sy = s.y + (t.ctlH - side) / 2.0f;
                     D2D1_ROUNDED_RECT sq = ui::RR(sx, sy, side, side, 5.0f * t.k);
                     rt_->FillRoundedRectangle(&sq, cb);
                     // A swatch whose colour sits close to the pill surface reads as an empty
@@ -480,26 +763,78 @@ private:
                     if (on) {
                         D2D1_ROUNDED_RECT ring = ui::RR(sx - 3.0f * t.k, sy - 3.0f * t.k,
                                                         side + 6.0f * t.k, side + 6.0f * t.k, 8.0f * t.k);
-                        rt_->DrawRoundedRectangle(&ring, cv_.brAccent, 2.0f, cv_.solid);
+                        rt_->DrawRoundedRectangle(&ring, cv_.brAccent, 1.5f, cv_.solid);
                     }
                     break;
                 }
 
                 case KIND_WIDTH: {
                     bool on = (s.width == width_);
-                    cv_.control(s.x, s.y, s.w, s.h, on ? ui::ST_ACTIVE : state_of(s));
+                    cv_.control(cx, s.y, (float)t.ctlH, (float)t.ctlH,
+                                on ? ui::ST_ACTIVE : state_of(s), group_of(s));
                     // The sample draws in the colour you are actually about to draw with, so
                     // the control previews the real stroke rather than a neutral grey tick.
                     D2D1_COLOR_F c = col2(color_);
                     if (!on) c.a = 0.55f;
                     ID2D1SolidColorBrush* ink = nullptr;
                     if (!cv_.brush(c, &ink)) ink = on ? cv_.brAccent : cv_.brMuted;
-                    float half = s.w * 0.34f, cx = s.x + s.w / 2, cy = s.y + s.h / 2;
+                    float half = t.ctlH * 0.34f, gx = cx + t.ctlH / 2.0f, gy = s.y + t.ctlH / 2.0f;
                     float thick = (1.5f + (float)std::max(1, s.width) * 0.75f) * t.k;
-                    rt_->DrawLine(D2D1_POINT_2F{ cx - half, cy }, D2D1_POINT_2F{ cx + half, cy },
+                    rt_->DrawLine(D2D1_POINT_2F{ gx - half, gy }, D2D1_POINT_2F{ gx + half, gy },
                                   ink, thick, cv_.solid);
+                    if (on) cap_br = cv_.brText;
                     break;
                 }
+
+                case KIND_BACKDROP: {
+                    // Card #7: the three text backdrops are swatches - same cell, same square,
+                    // same ring as a colour swatch. Only fill, border and ring change (8.5).
+                    bool on = (s.width == backdrop_);
+                    bool hov = (hover_slot_ == slot_index(s));
+                    cv_.control(cx, s.y, (float)t.ctlH, (float)t.ctlH,
+                                on ? ui::ST_ACTIVE : state_of(s), group_of(s));
+                    float side = 22.0f * t.k;
+                    float sx = cx + (t.ctlH - side) / 2.0f, sy = s.y + (t.ctlH - side) / 2.0f;
+                    D2D1_ROUNDED_RECT sq = ui::RR(sx, sy, side, side, 5.0f * t.k);
+                    ID2D1SolidColorBrush* fb = nullptr;
+                    if (s.width == 1) cv_.brush(t.textPrimary, &fb);
+                    else if (s.width == 2) cv_.brush(t.canvas, &fb);
+                    if (fb) rt_->FillRoundedRectangle(&sq, fb);
+                    ID2D1SolidColorBrush* bb = nullptr;
+                    cv_.brush(s.width == 1 ? t.borderSoft : t.borderStrong, &bb);
+                    float bw = (s.width == 0) ? t.strokeW : 1.0f;
+                    if (bb) {
+                        rt_->DrawRoundedRectangle(&sq, bb, bw, cv_.solid);
+                        if (s.width == 0)   // the "no fill" sign: contour plus one diagonal
+                            rt_->DrawLine(D2D1_POINT_2F{ sx, sy }, D2D1_POINT_2F{ sx + side, sy + side },
+                                          bb, t.strokeW, cv_.solid);
+                    }
+                    if (on) {
+                        D2D1_ROUNDED_RECT ring = ui::RR(sx - 3.0f * t.k, sy - 3.0f * t.k,
+                                                        side + 6.0f * t.k, side + 6.0f * t.k, 8.0f * t.k);
+                        rt_->DrawRoundedRectangle(&ring, cv_.brAccent, 1.5f, cv_.solid);
+                    }
+                    if (on || hov) cap_br = cv_.brText;
+                    break;
+                }
+            }
+
+            if (!s.caption.empty() && cv_.fmtCaption)
+                cv_.draw_layout(s.caption.c_str(), cv_.fmtCaption, s.x, s.y + t.ctlH + t.s4,
+                                s.w, capH, cap_br, DWRITE_TEXT_ALIGNMENT_CENTER,
+                                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+
+        // Group captions stand in the same 25 px band, left-aligned to their own group, and cost
+        // no width: the band is already paid for by the signed cells (8.1).
+        int rows = rows_();
+        for (int r = 0; r < rows; ++r) {
+            float bandY = pill_y_ + t.s6 + r * (cell_h() + t.s6) + t.ctlH + t.s4;
+            for (int g = 0; g < GRP_COUNT; ++g) {
+                if (group_caption_[g].empty() || grp_w_[r][g] <= 0.0f) continue;
+                cv_.draw_layout(group_caption_[g].c_str(), cv_.fmtCaption, grp_x_[r][g], bandY,
+                                grp_w_[r][g], capH, brCap, DWRITE_TEXT_ALIGNMENT_LEADING,
+                                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             }
         }
     }
@@ -517,10 +852,63 @@ private:
     static D2D1_COLOR_F col2(COLORREF c) {
         return D2D1_COLOR_F{ GetRValue(c) / 255.0f, GetGValue(c) / 255.0f, GetBValue(c) / 255.0f, 1.0f };
     }
+    static COLORREF to_rgb(const D2D1_COLOR_F& c) {
+        auto q = [](float v) { if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f; return (int)(v * 255.0f + 0.5f); };
+        return RGB(q(c.r), q(c.g), q(c.b));
+    }
+
+    D2D1_COLOR_F backdrop_color(int mode) const {
+        return mode == 1 ? theme_.textPrimary : theme_.canvas;   // 8.5: no new tokens
+    }
+
+    // Ink stays readable on the backdrop: only pairs under 3:1 are touched, and the replacement is
+    // the opposite half of the same textPrimary/canvas pair (the three cases in 8.5).
+    D2D1_COLOR_F readable_ink(D2D1_COLOR_F ink, int mode) const {
+        D2D1_COLOR_F bg = backdrop_color(mode);
+        if (Theme::contrast(ink, bg) >= 3.0f) return ink;
+        bool light = Theme::lum(bg) > 0.5f;
+        return Theme::mix(ink, light ? theme_.canvas : theme_.textPrimary, 0.75f);
+    }
+
+    // The anchor of a text stroke is the top-left of its layout box, which is also where the
+    // export rasteriser puts it. Backdrop = that box inflated by s4, radius rControl (8.5).
+    void text_box(const Stroke& s, const std::wstring& txt, float& x, float& y, float& w, float& h) const {
+        x = img_org_x_ + (float)s.pts.front().x;
+        y = img_org_y_ + (float)s.pts.front().y;
+        w = cv_.measure(txt.c_str(), cv_.fmtBody);
+        if (w < 1.0f) w = 1.0f;
+        h = (float)(theme_.fsBody * 4 / 3);
+    }
+
+    void paint_text(const Stroke& s, const std::wstring& txt, bool caret) {
+        if (txt.empty() || !cv_.fmtBody || s.pts.empty()) return;
+        const Theme& t = theme_;
+        float x, y, w, h;
+        text_box(s, txt, x, y, w, h);
+        D2D1_COLOR_F ink = col2(s.color);
+        if (s.backdrop) {
+            ID2D1SolidColorBrush* fb = nullptr;
+            if (cv_.brush(backdrop_color(s.backdrop), &fb)) {
+                D2D1_ROUNDED_RECT rr = cv_.R2rr(x - t.s4, y - t.s4, w + 2.0f * t.s4, h + 2.0f * t.s4,
+                                                t.rControl);
+                rt_->FillRoundedRectangle(&rr, fb);
+            }
+            ink = readable_ink(ink, s.backdrop);
+        }
+        ID2D1SolidColorBrush* ib = nullptr;
+        if (!cv_.brush(ink, &ib)) return;
+        cv_.draw_layout(txt.c_str(), cv_.fmtBody, x, y, w, h, ib, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (caret) {          // static caret: a blinking one is not needed to read "you are typing"
+            rt_->DrawLine(D2D1_POINT_2F{ x + w + 2.0f, y }, D2D1_POINT_2F{ x + w + 2.0f, y + h },
+                          cv_.brText, 1.5f * t.k, cv_.solid);
+        }
+    }
 
     // Strokes are drawn as geometry so the on-screen preview is antialiased.
     void paint_stroke(const Stroke& s) {
         if (s.pts.empty()) return;
+        if (s.tool == TOOL_TEXT) { paint_text(s, s.text, false); return; }
+
         const Theme& t = theme_;
         D2D1_COLOR_F c = col2(s.color);
         if (s.tool == TOOL_MARKER) c.a = 0.45f;
@@ -528,17 +916,6 @@ private:
         ID2D1SolidColorBrush* br = nullptr;
         if (!cv_.brush(c, &br)) return;
         const float w = (float)std::max(1, s.width) * t.k;
-
-        if (s.tool == TOOL_TEXT) {
-            if (s.text.empty() || !cv_.fmtBody) return;
-            POINT p = s.pts.front();
-            D2D1_RECT_F r = ui::R(img_org_x_ + (float)p.x, img_org_y_ + (float)p.y - t.fsBody * 1.2f,
-                                  (float)std::max(240, (int)s.text.size() * t.fsBody),
-                                  (float)(t.fsH2 + t.s8));
-            rt_->DrawText(s.text.c_str(), (UINT)s.text.size(), cv_.fmtBody, &r, br,
-                          D2D1_DRAW_TEXT_OPTIONS_NONE);
-            return;
-        }
 
         auto P = [&](POINT p) { return D2D1_POINT_2F{ img_org_x_ + (float)p.x, img_org_y_ + (float)p.y }; };
 
@@ -622,11 +999,13 @@ private:
 
     void on_down(int mx, int my) {
         if (const Slot* s = hit(mx, my)) {
+            if (text_edit_) commit_text();          // a control click keeps what has been typed
             hover_slot_ = slot_index(*s);
             switch (s->kind) {
-                case KIND_TOOL:  tool_ = s->tool; InvalidateRect(hwnd_, nullptr, TRUE); return;
+                case KIND_TOOL:  set_tool(s->tool); return;
                 case KIND_COLOR: color_ = s->color; InvalidateRect(hwnd_, nullptr, TRUE); return;
                 case KIND_WIDTH: width_ = s->width; InvalidateRect(hwnd_, nullptr, TRUE); return;
+                case KIND_BACKDROP: backdrop_ = s->width; InvalidateRect(hwnd_, nullptr, TRUE); return;
                 case KIND_ACTION: do_action(s->action); return;
                 default: break;
             }
@@ -640,21 +1019,88 @@ private:
             return;
         }
 
+        if (tool_ == TOOL_TEXT) { start_text(mx, my); return; }
+
         drawing_ = true;
         text_buffer_.clear();
-        cur_ = Stroke{ tool_, { { imgX(mx), imgY(my) } }, color_, width_, L"" };
+        cur_ = Stroke{ tool_, { { imgX(mx), imgY(my) } }, color_, width_, L"", backdrop_ };
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
+    // Card #6: text is click -> type -> Enter, not drag. The click that places the caret is
+    // released long before the first key is typed, so mouse-up must not end the edit.
+    void start_text(int mx, int my) {
+        if (text_edit_) {                     // a second click moves the anchor being typed at
+            cur_.pts[0] = { imgX(mx), imgY(my) };
+            InvalidateRect(hwnd_, nullptr, TRUE);
+            return;
+        }
+        text_edit_ = true;
+        text_buffer_.clear();
+        cur_ = Stroke{ TOOL_TEXT, { { imgX(mx), imgY(my) } }, color_, width_, L"", backdrop_ };
+        InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+
+    void commit_text() {
+        if (!text_edit_) return;
+        text_edit_ = false;
+        cur_.text = text_buffer_;
+        text_buffer_.clear();
+        if (!cur_.text.empty()) commit_stroke();
+        cur_ = Stroke{};
+        InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+
+    void cancel_text() {
+        text_edit_ = false;
+        text_buffer_.clear();
+        cur_ = Stroke{};
+        InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+
+    void commit_stroke() {
+        strokes_.push_back(cur_);
+        Change c;
+        c.stroke = cur_;
+        undo_.push_back(c);
+        redo_.clear();
+    }
+
     void do_action(int a) {
-        if (a == 0) {                                   // undo
-            if (!undo_.empty()) { redo_.push_back(undo_.back()); undo_.pop_back(); }
-        } else if (a == 1) {                            // redo
-            if (!redo_.empty()) { undo_.push_back(redo_.back()); redo_.pop_back(); }
-        } else if (a == 2) {                            // copy to clipboard and close
-            copy_requested_ = true; saved_ = true; PostQuitMessage(0); return;
-        } else if (a == 3) {                            // save and close
-            copy_requested_ = false; saved_ = true; PostQuitMessage(0); return;
+        if (a == 0 || a == 1) {
+            std::vector<Change>& from = (a == 0) ? undo_ : redo_;
+            std::vector<Change>& to = (a == 0) ? redo_ : undo_;
+            if (from.empty()) return;
+            Change c = from.back();          // copied, not moved: both sides stay undoable
+            from.pop_back();
+            if (c.is_crop) {
+                img_ = (a == 0) ? c.img_before : c.img_after;
+                strokes_ = (a == 0) ? c.st_before : c.st_after;
+                refresh_image_bitmap();
+                ensure_image_visible();
+            } else if (a == 0) {
+                if (!strokes_.empty()) strokes_.pop_back();
+            } else {
+                strokes_.push_back(c.stroke);
+            }
+            to.push_back(std::move(c));
+        } else if (a == 2) {                                    // clipboard only, no file (8.7)
+            if (copy_fn_ && copy_fn_(compose_result())) {
+                produced_ = true; status_msg_ = L"Скопировано в буфер обмена"; status_bad_ = false;
+            } else {
+                status_msg_ = L"Не удалось скопировать"; status_bad_ = true;
+            }
+        } else if (a == 3) {                                    // file, and the window stays open
+            if (!save_fn_) return;
+            std::wstring path;
+            OutputResult r = save_fn_(compose_result(), hwnd_, path);
+            if (r == OUT_SAVED) {
+                produced_ = true; status_msg_ = L"Сохранено: " + path; status_bad_ = false;
+            } else if (r == OUT_CANCELLED) {
+                status_msg_ = L"Сохранение отменено"; status_bad_ = false;
+            } else {
+                status_msg_ = L"Не удалось сохранить: " + path; status_bad_ = true;
+            }
         }
         InvalidateRect(hwnd_, nullptr, TRUE);
     }
@@ -681,51 +1127,60 @@ private:
         if (crop_active_) {
             crop_active_ = false;
             apply_crop(crop_a_, crop_b_);
-            refresh_image_bitmap();
             InvalidateRect(hwnd_, nullptr, TRUE);
             return;
         }
-        if (!drawing_) return;
+        if (!drawing_ || text_edit_) return;
         drawing_ = false;
         on_move(mx, my);
-        if (cur_.tool == TOOL_TEXT) {
-            cur_.text = text_buffer_;
-            if (cur_.text.empty()) { InvalidateRect(hwnd_, nullptr, TRUE); return; }
-        }
-        bool enough = cur_.pts.size() >= 2 || cur_.tool == TOOL_TEXT;
-        if (enough) { undo_.push_back(cur_); redo_.clear(); }
+        if (cur_.pts.size() >= 2) commit_stroke();
         cur_ = Stroke{};
         InvalidateRect(hwnd_, nullptr, TRUE);
     }
 
     void on_key(int vk) {
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (text_edit_ && !ctrl) {
+            if (vk == VK_RETURN) { commit_text(); return; }
+            if (vk == VK_ESCAPE) { cancel_text(); return; }   // Esc closes the text, not the editor
+        }
         if (ctrl && vk == 'Z') { do_action(0); return; }
         if (ctrl && vk == 'Y') { do_action(1); return; }
         if (ctrl && vk == 'S') { do_action(3); return; }
         if (ctrl && vk == 'C') { do_action(2); return; }
-        if (vk == VK_ESCAPE) { discard_ = true; saved_ = false; PostQuitMessage(0); return; }
-        if (vk == VK_DELETE) { if (!undo_.empty()) { undo_.pop_back(); InvalidateRect(hwnd_, nullptr, TRUE); } return; }
-        if (!drawing_) {
+        if (vk == VK_ESCAPE) { PostQuitMessage(0); return; }
+        if (vk == VK_DELETE) {
+            if (!undo_.empty() && !undo_.back().is_crop) do_action(0);
+            return;
+        }
+        if (!drawing_ && !text_edit_) {
             const int tools[6] = { TOOL_ARROW, TOOL_TEXT, TOOL_RECT, TOOL_ELLIPSE, TOOL_MARKER, TOOL_CROP };
-            if (vk >= '1' && vk <= '6') { tool_ = (Tool)tools[vk - '1']; InvalidateRect(hwnd_, nullptr, TRUE); }
+            if (vk >= '1' && vk <= '6') set_tool((Tool)tools[vk - '1']);
         }
     }
 
     void on_char(wchar_t c) {
-        if (drawing_ && cur_.tool == TOOL_TEXT) {
-            if (c == 8 && !text_buffer_.empty()) { text_buffer_.pop_back(); InvalidateRect(hwnd_, nullptr, TRUE); return; }
-            if (c >= 32) { text_buffer_ += c; InvalidateRect(hwnd_, nullptr, TRUE); }
-        }
+        if (!text_edit_) return;
+        if (c == 8 && !text_buffer_.empty()) { text_buffer_.pop_back(); InvalidateRect(hwnd_, nullptr, TRUE); return; }
+        if (c == 3) return;                       // Ctrl+C is an action, not text
+        if (c >= 32) { text_buffer_ += c; InvalidateRect(hwnd_, nullptr, TRUE); }
     }
 
     int imgX(int mx) const { return (std::max)(0, (std::min)(img_.w - 1, mx - img_org_x_)); }
     int imgY(int my) const { return (std::max)(0, (std::min)(img_.h - 1, my - img_org_y_)); }
 
+    // A crop is one history step carrying both sides of itself (card #5): undoing it has to bring
+    // back the pixels it removed and the annotations that were rebased into it.
     void apply_crop(POINT a, POINT b) {
         int x0 = (std::min)(a.x, b.x), x1 = (std::max)(a.x, b.x);
         int y0 = (std::min)(a.y, b.y), y1 = (std::max)(a.y, b.y);
         if (x1 - x0 < 8 || y1 - y0 < 8) return;
+
+        Change c;
+        c.is_crop = true;
+        c.img_before = img_;
+        c.st_before = strokes_;
+
         DIB out;
         out.w = x1 - x0; out.h = y1 - y0;
         out.rgba.assign((size_t)out.w * out.h * 4, 0);
@@ -733,14 +1188,35 @@ private:
             memcpy(&out.rgba[(size_t)y * out.w * 4], img_.px(0, y0 + y), (size_t)out.w * 4);
 
         std::vector<Stroke> kept;
-        for (auto& s : undo_) {
+        for (auto& s : strokes_) {
             bool inside = true;
             for (auto& p : s.pts) if (p.x < x0 || p.x > x1 || p.y < y0 || p.y > y1) { inside = false; break; }
             if (inside) { for (auto& p : s.pts) { p.x -= x0; p.y -= y0; } kept.push_back(s); }
         }
         img_ = std::move(out);
-        undo_ = std::move(kept);
+        strokes_ = std::move(kept);
+        c.img_after = img_;
+        c.st_after = strokes_;
+
+        undo_.push_back(std::move(c));
         redo_.clear();
+        refresh_image_bitmap();
+    }
+
+    // Undoing a crop puts back pixels that are larger than the window may currently be.
+    void ensure_image_visible() {
+        if (!hwnd_) return;
+        RECT cr; GetClientRect(hwnd_, &cr);
+        int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+        layout();
+        int needW = (std::max)(img_.w + 2 * PAD, pill_w_ + theme_.s24);
+        int needH = theme_.s12 + (int)pill_h_ + PAD_TOP + img_.h + PAD_BOTTOM + FOOT_H;
+        if (cw >= needW && ch >= needH) return;
+        int scrW = GetSystemMetrics(SM_CXSCREEN), scrH = GetSystemMetrics(SM_CYSCREEN);
+        int w = (std::min)((std::max)(cw, needW) + frame_w_, scrW - 8);
+        int h = (std::min)((std::max)(ch, needH) + frame_h_, scrH - 8);
+        SetWindowPos(hwnd_, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+        dbg("ensure_image_visible: grew window");
     }
 
     // ---- export rasterisers: the saved PNG is produced here, in image-space px ---------
@@ -777,16 +1253,75 @@ private:
             }
         }
     }
+    // Exported text is real font text, not a filled bar: 0.1 painted a solid rectangle and the
+    // harness could only ever see "there are coloured pixels here". GDI is used because the export
+    // target is a plain DIB; the same readable_ink()/backdrop numbers as the preview are applied,
+    // so the file and the screen agree.
+    void draw_text_img(DIB& d, const Stroke& s) {
+        if (s.text.empty()) return;
+        const Theme& t = theme_;
+        HDC screen = GetDC(nullptr);
+        HDC dc = CreateCompatibleDC(screen);
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = d.w;
+        bi.bmiHeader.biHeight = -d.h;                 // top-down: (0,0) is the image top-left
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        HBITMAP oldbmp = bmp ? (HBITMAP)SelectObject(dc, bmp) : nullptr;
+        size_t n = (size_t)d.w * d.h;
+        if (bmp && bits) {
+            uint8_t* px = (uint8_t*)bits;
+            for (size_t i = 0; i < n; ++i) {          // RGBA -> BGRA, GDI ignores alpha
+                px[i * 4 + 0] = d.rgba[i * 4 + 2];
+                px[i * 4 + 1] = d.rgba[i * 4 + 1];
+                px[i * 4 + 2] = d.rgba[i * 4 + 0];
+                px[i * 4 + 3] = 0;
+            }
+            HFONT font = CreateFontW(-t.fsBody, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            HFONT oldfont = (HFONT)SelectObject(dc, font);
+            SetBkMode(dc, TRANSPARENT);
+            SIZE ts = { 0, 0 };
+            GetTextExtentPoint32W(dc, s.text.c_str(), (int)s.text.size(), &ts);
+            int bx = s.pts.front().x, by = s.pts.front().y;
+            int bw = (std::max)((int)ts.cx, 1), bh = (std::max)((int)ts.cy, t.fsBody * 4 / 3);
+            D2D1_COLOR_F ink = col2(s.color);
+            if (s.backdrop) {
+                COLORREF bc = to_rgb(backdrop_color(s.backdrop));
+                HBRUSH br = CreateSolidBrush(bc), oldbr = (HBRUSH)SelectObject(dc, br);
+                HPEN pen = CreatePen(PS_SOLID, 1, bc), oldpen = (HPEN)SelectObject(dc, pen);
+                int rd = (int)(5.0f * t.k);
+                RoundRect(dc, bx - t.s4, by - t.s4, bx + bw + t.s4, by + bh + t.s4, rd * 2, rd * 2);
+                SelectObject(dc, oldpen); DeleteObject(pen);
+                SelectObject(dc, oldbr); DeleteObject(br);
+                ink = readable_ink(ink, s.backdrop);
+            }
+            SetTextColor(dc, to_rgb(ink));
+            RECT r{ bx, by, bx + bw, by + bh };
+            DrawTextW(dc, s.text.c_str(), (int)s.text.size(), &r,
+                      DT_NOCLIP | DT_LEFT | DT_TOP | DT_SINGLELINE);
+            SelectObject(dc, oldfont); DeleteObject(font);
+            uint8_t* src = (uint8_t*)bits;
+            for (size_t i = 0; i < n; ++i) {          // BGRA -> RGBA
+                d.rgba[i * 4 + 0] = src[i * 4 + 2];
+                d.rgba[i * 4 + 1] = src[i * 4 + 1];
+                d.rgba[i * 4 + 2] = src[i * 4 + 0];
+            }
+        }
+        if (oldbmp) SelectObject(dc, oldbmp);
+        if (bmp) DeleteObject(bmp);
+        DeleteDC(dc);
+        ReleaseDC(nullptr, screen);
+    }
+
     void draw_stroke_img(DIB& d, const Stroke& s) {
         if (s.pts.empty()) return;
-        if (s.tool == TOOL_TEXT) {
-            if (s.text.empty()) return;
-            POINT p = s.pts.front();
-            int w = (int)s.text.size() * 11;
-            for (int y = 0; y < 16; ++y)
-                for (int x = 0; x < w; ++x) put_img(d, p.x + x, p.y - 16 + y, s.color);
-            return;
-        }
+        if (s.tool == TOOL_TEXT) { draw_text_img(d, s); return; }
         if ((s.tool == TOOL_RECT || s.tool == TOOL_ELLIPSE) && s.pts.size() >= 2) {
             POINT a = s.pts.front(), b = s.pts.back();
             int x0 = std::min(a.x, b.x), x1 = std::max(a.x, b.x);
@@ -815,7 +1350,9 @@ private:
     HWND hwnd_ = nullptr;
     ID2D1Factory* factory_ = nullptr;
     IDWriteFactory* dwrite_ = nullptr;
-    ID2D1HwndRenderTarget* rt_ = nullptr;
+    ID2D1RenderTarget* rt_ = nullptr;      // a DC target: D2D draws into memdc_/dib_
+    HDC memdc_ = nullptr;
+    HBITMAP dib_ = nullptr;
     ui::Canvas cv_;
     Theme theme_;
 
@@ -834,11 +1371,18 @@ private:
     };
     std::vector<int> widths_ = { 2, 4, 8 };
 
-    std::vector<Stroke> undo_, redo_;
+    std::vector<Stroke> strokes_;              // what is currently on the image
+    std::vector<Change> undo_, redo_;          // committed steps, crops included
     Stroke cur_;
-    bool drawing_ = false, crop_active_ = false;
+    bool drawing_ = false, crop_active_ = false, text_edit_ = false;
     POINT crop_a_{}, crop_b_{};
     std::wstring text_buffer_;
     int hover_slot_ = -1;
-    bool saved_ = false, discard_ = false, copy_requested_ = false;
+    int backdrop_ = 0;                          // 0 none / 1 light / 2 dark, applies to new text
+    std::wstring status_msg_;
+    bool status_bad_ = false;
+    bool produced_ = false;                     // at least one Save/Copy happened in this session
+    SaveFn save_fn_ = nullptr;
+    CopyFn copy_fn_ = nullptr;
+    int frame_w_ = 0, frame_h_ = 0;
 };

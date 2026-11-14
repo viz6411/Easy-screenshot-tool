@@ -26,6 +26,10 @@ enum Glyph {
 
 enum ControlState { ST_NORMAL = 0, ST_HOVER, ST_ACTIVE, ST_PRESSED, ST_DISABLED };
 
+// Which group of the toolbar a control belongs to: tools (raised chip), history (flat, outline
+// only), output (recessed niche). Groups must read apart from each other without a caption.
+enum ControlGroup { CG_TOOL = 0, CG_PLAIN, CG_SUNKEN };
+
 // Build a full ellipse out of four cubic beziers (no arc API needed).
 inline void add_ellipse(ID2D1GeometrySink* s, float cx, float cy, float rx, float ry) {
     const float K = 0.5522847498f;
@@ -88,36 +92,47 @@ inline void add_arc_head(ID2D1GeometrySink* s, const ArcSpec& a, float b) {
     s->EndFigure(D2D1_FIGURE_END_CLOSED);
 }
 
-// Chisel highlighter. The nib and the body are separate quads with a gap between them - that
-// gap is what reads as the ferrule - and a band alongside is the mark it has just laid down.
-// Without the band the glyph is a slanted blob and reads as a second arrow.
+// Chisel highlighter, built as a tool and not as three blobs: a hollow body (drawn as a tube
+// outline), a filled chisel head, a ferrule that is wider than the body and stands apart from
+// both the head and the body, and the horizontal streak it has just laid. The hollow body is
+// the whole point: a filled 9px-wide body at a 2.8px stroke merges into one blob, which is how
+// this icon read in 0.1.
 struct MarkerShape {
-    D2D1_POINT_2F nib[4], body[4], streak[4];
+    D2D1_POINT_2F nib[4], ferrule[4], streak[4];
+    D2D1_POINT_2F body[4];          // A0, A1, B1, B0 - the tube outline
 };
 
 inline void marker_shape(float cx, float cy, float b, MarkerShape& m) {
     const float ux = 0.7071f, uy = -0.7071f;              // along the pen, up and right
     const float vx = 0.7071f, vy = 0.7071f;               // across the pen, down and right
-    const float nx = cx - b * 0.30f, ny = cy + b * 0.22f; // nib tip
-    const float t1 = b * 0.17f, t2 = b * 0.26f, t3 = b * 0.68f;
-    const float wNib = b * 0.185f, wJoin = b * 0.105f;    // the chisel is much wider than the body
-    const float wBody = b * 0.085f, wCap = b * 0.115f;
+    const float nx = cx - b * 0.195f, ny = cy + b * 0.16f;  // nib tip, lower-left of the box
+    const float t1 = b * 0.135f;                          // top of the chisel head
+    const float f0 = b * 0.19f, f1 = b * 0.245f;          // ferrule, with a gap on both sides
+    const float t2 = b * 0.30f, t3 = b * 0.70f;           // body, ending short of the box edge
+    const float wTip = b * 0.13f, wTop = b * 0.09f;       // chisel: wide at the tip, narrower up
+    const float wFer = b * 0.17f, wBody = b * 0.135f;     // the ferrule is wider than the body
 
-    m.nib[0] = D2D1_POINT_2F{ nx + vx * wNib, ny + vy * wNib };
-    m.nib[1] = D2D1_POINT_2F{ nx - vx * wNib, ny - vy * wNib };
-    m.nib[2] = D2D1_POINT_2F{ nx + ux * t1 - vx * wJoin, ny + uy * t1 - vy * wJoin };
-    m.nib[3] = D2D1_POINT_2F{ nx + ux * t1 + vx * wJoin, ny + uy * t1 + vy * wJoin };
+    m.nib[0] = D2D1_POINT_2F{ nx + vx * wTip,  ny + vy * wTip };
+    m.nib[1] = D2D1_POINT_2F{ nx - vx * wTip,  ny - vy * wTip };
+    m.nib[2] = D2D1_POINT_2F{ nx + ux * t1 - vx * wTop, ny + uy * t1 - vy * wTop };
+    m.nib[3] = D2D1_POINT_2F{ nx + ux * t1 + vx * wTop, ny + uy * t1 + vy * wTop };
+
+    m.ferrule[0] = D2D1_POINT_2F{ nx + ux * f0 - vx * wFer, ny + uy * f0 - vy * wFer };
+    m.ferrule[1] = D2D1_POINT_2F{ nx + ux * f0 + vx * wFer, ny + uy * f0 + vy * wFer };
+    m.ferrule[2] = D2D1_POINT_2F{ nx + ux * f1 + vx * wFer, ny + uy * f1 + vy * wFer };
+    m.ferrule[3] = D2D1_POINT_2F{ nx + ux * f1 - vx * wFer, ny + uy * f1 - vy * wFer };
 
     m.body[0] = D2D1_POINT_2F{ nx + ux * t2 - vx * wBody, ny + uy * t2 - vy * wBody };
-    m.body[1] = D2D1_POINT_2F{ nx + ux * t2 + vx * wBody, ny + uy * t2 + vy * wBody };
-    m.body[2] = D2D1_POINT_2F{ nx + ux * t3 + vx * wCap, ny + uy * t3 + vy * wCap };
-    m.body[3] = D2D1_POINT_2F{ nx + ux * t3 - vx * wCap, ny + uy * t3 - vy * wCap };
+    m.body[1] = D2D1_POINT_2F{ nx + ux * t3 - vx * wBody, ny + uy * t3 - vy * wBody };
+    m.body[2] = D2D1_POINT_2F{ nx + ux * t3 + vx * wBody, ny + uy * t3 + vy * wBody };
+    m.body[3] = D2D1_POINT_2F{ nx + ux * t2 + vx * wBody, ny + uy * t2 + vy * wBody };
 
-    const float s0 = b * 0.06f, s1 = b * 0.40f, so = b * 0.26f, sw = b * 0.075f;
-    m.streak[0] = D2D1_POINT_2F{ nx + ux * s0 + vx * (so - sw), ny + uy * s0 + vy * (so - sw) };
-    m.streak[1] = D2D1_POINT_2F{ nx + ux * s1 + vx * (so - sw), ny + uy * s1 + vy * (so - sw) };
-    m.streak[2] = D2D1_POINT_2F{ nx + ux * s1 + vx * (so + sw), ny + uy * s1 + vy * (so + sw) };
-    m.streak[3] = D2D1_POINT_2F{ nx + ux * s0 + vx * (so + sw), ny + uy * s0 + vy * (so + sw) };
+    // The streak lies flat along the bottom edge of the box: it is what separates this glyph
+    // from a second diagonal arrow, and it touches the nib end.
+    m.streak[0] = D2D1_POINT_2F{ cx - b * 0.44f, cy + b * 0.32f };
+    m.streak[1] = D2D1_POINT_2F{ cx + b * 0.02f, cy + b * 0.32f };
+    m.streak[2] = D2D1_POINT_2F{ cx + b * 0.02f, cy + b * 0.44f };
+    m.streak[3] = D2D1_POINT_2F{ cx - b * 0.44f, cy + b * 0.44f };
 }
 
 inline D2D1_RECT_F R(float x, float y, float w, float h) {
@@ -138,7 +153,8 @@ public:
     ID2D1StrokeStyle* solid = nullptr;    // round caps + round joins
     ID2D1StrokeStyle* dashed = nullptr;   // 6/4 custom dash, round caps
 
-    ID2D1SolidColorBrush *brText = nullptr, *brMuted = nullptr, *brAccent = nullptr,
+    ID2D1SolidColorBrush *brText = nullptr, *brMuted = nullptr, *brSecondary = nullptr,
+                          *brAccent = nullptr,
                           *brSurface = nullptr, *brBorder = nullptr, *brHover = nullptr,
                           *brFill = nullptr, *brFocus = nullptr, *brSoft = nullptr;
 
@@ -162,16 +178,17 @@ public:
         float dash[] = { 6.0f, 4.0f };
         { HRESULT hr = fac->CreateStrokeStyle(&p, dash, 2, &dashed); if (FAILED(hr) && SUCCEEDED(worst)) worst = hr; }
 
-        ID2D1SolidColorBrush* brs[9] = {};
-        const D2D1_COLOR_F cols[9] = { th->textPrimary, th->textTertiary, th->accentGlyph, th->floating,
-                                       th->borderStrong, th->controlHover, th->accentFill, th->focusRing,
-                                       th->borderSoft };
-        for (int i = 0; i < 9; ++i) {
+        ID2D1SolidColorBrush* brs[10] = {};
+        const D2D1_COLOR_F cols[10] = { th->textPrimary, th->textTertiary, th->accentGlyph, th->floating,
+                                        th->borderStrong, th->controlHover, th->accentFill, th->focusRing,
+                                        th->borderSoft, th->textSecondary };
+        for (int i = 0; i < 10; ++i) {
             HRESULT hr = rt->CreateSolidColorBrush(cols[i], &brs[i]);
             if (FAILED(hr) && SUCCEEDED(worst)) worst = hr;
         }
         brText = brs[0]; brMuted = brs[1]; brAccent = brs[2]; brSurface = brs[3];
         brBorder = brs[4]; brHover = brs[5]; brFill = brs[6]; brFocus = brs[7]; brSoft = brs[8];
+        brSecondary = brs[9];                 // the save path in the status strip (8.7 case 2)
 
         auto mk = [&](DWRITE_FONT_WEIGHT w, FLOAT size, IDWriteTextFormat** out) {
             HRESULT hr = dw_->CreateTextFormat(L"Segoe UI", nullptr, w, DWRITE_FONT_STYLE_NORMAL,
@@ -194,9 +211,11 @@ public:
         rel((IUnknown*)brText); rel((IUnknown*)brMuted); rel((IUnknown*)brAccent);
         rel((IUnknown*)brSurface); rel((IUnknown*)brBorder); rel((IUnknown*)brHover);
         rel((IUnknown*)brFill); rel((IUnknown*)brFocus); rel((IUnknown*)brSoft);
+        rel((IUnknown*)brSecondary);
         rel((IUnknown*)fmtCaption); rel((IUnknown*)fmtBody); rel((IUnknown*)fmtLabel);
         solid = dashed = nullptr;
         brText = brMuted = brAccent = brSurface = brBorder = brHover = brFill = brFocus = brSoft = nullptr;
+        brSecondary = nullptr;
         fmtCaption = fmtBody = fmtLabel = nullptr;
     }
 
@@ -220,22 +239,44 @@ public:
         rt->DrawLine(D2D1_POINT_2F{ x0, y }, D2D1_POINT_2F{ x1, y }, b);
     }
 
-    void control(float x, float y, float w, float h, ControlState st) {
+    void control(float x, float y, float w, float h, ControlState st, ControlGroup grp = CG_TOOL) {
         if (!rt || !th) return;
-        D2D1_COLOR_F fillc = th->control;
-        ID2D1SolidColorBrush* brush = nullptr;
-        switch (st) {
-            case ST_NORMAL:   fillc = th->control;        break;
-            case ST_HOVER:    fillc = th->controlHover;   break;
-            case ST_PRESSED:  fillc = th->controlPressed; break;
-            case ST_ACTIVE:   fillc = th->accentFill;     break;
-            case ST_DISABLED: fillc = th->canvas;         break;   // disabled reads as a recess
+        // The group decides the resting surface; the state decides the change on top of it.
+        // Tools sit on `control`, history sits on the pill surface (only its border is bright),
+        // output sits in a `canvas` recess. Three surfaces is what makes the groups read without
+        // a caption; a single surface plus separator lines was the 0.1 layout.
+        D2D1_COLOR_F fillc = th->control, borderc = th->borderSoft;
+        bool no_fill = false, no_border = false;
+        float bw = 1.0f;
+        switch (grp) {
+            case CG_PLAIN:
+                if (st == ST_NORMAL) { no_fill = true; borderc = th->borderStrong; }
+                else if (st == ST_HOVER) fillc = th->control;
+                else if (st == ST_PRESSED) fillc = th->controlPressed;
+                else if (st == ST_DISABLED) { fillc = th->canvas; no_border = true; }
+                else { fillc = th->control; }
+                break;
+            case CG_SUNKEN:
+                fillc = th->canvas;
+                if (st == ST_HOVER) fillc = th->control;
+                else if (st == ST_PRESSED) fillc = th->controlPressed;
+                break;
+            default:
+                if (st == ST_HOVER) fillc = th->controlHover;
+                else if (st == ST_PRESSED) fillc = th->controlPressed;
+                else if (st == ST_ACTIVE) fillc = th->accentFill;
+                else if (st == ST_DISABLED) fillc = th->canvas;
+                break;
         }
-        if (!cache_brush(fillc, &brush)) return;
+        if (st == ST_ACTIVE && grp == CG_TOOL) { borderc = th->accentGlyph; bw = 1.5f; }
+        ID2D1SolidColorBrush* brush = nullptr;
+        if (!no_fill && !cache_brush(fillc, &brush)) return;
         D2D1_ROUNDED_RECT rr = R2(x, y, w, h, th->rControl);
-        rt->FillRoundedRectangle(&rr, brush);
-        if (st == ST_ACTIVE) rt->DrawRoundedRectangle(&rr, brAccent, 1.5f, solid);
-        else                 rt->DrawRoundedRectangle(&rr, brSoft, 1.0f, solid);
+        if (!no_fill) rt->FillRoundedRectangle(&rr, brush);
+        if (!no_border) {
+            ID2D1SolidColorBrush* bb = nullptr;
+            if (cache_brush(borderc, &bb)) rt->DrawRoundedRectangle(&rr, bb, bw, solid);
+        }
     }
 
     void text(const wchar_t* s, float x, float y, float w, float h,
@@ -250,11 +291,30 @@ public:
         rt->DrawText(s, (UINT)wcslen(s), f, &r, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
 
+    // Text with explicit alignment: the shared formats are leading-aligned, and a caption has to
+    // sit centred in its cell box (TOOLBAR-SPEC 8.1), which DrawText through a format cannot do.
+    void draw_layout(const wchar_t* s, IDWriteTextFormat* fmt, float x, float y, float w, float h,
+                     ID2D1SolidColorBrush* brush, DWRITE_TEXT_ALIGNMENT align,
+                     DWRITE_PARAGRAPH_ALIGNMENT pa = DWRITE_PARAGRAPH_ALIGNMENT_NEAR) {
+        if (!dw_ || !fmt || !brush || !s || !*s) return;
+        IDWriteTextLayout* l = nullptr;
+        if (FAILED(dw_->CreateTextLayout(s, (UINT)wcslen(s), fmt, w, h, &l)) || !l) return;
+        l->SetTextAlignment(align);
+        l->SetParagraphAlignment(pa);
+        D2D1_POINT_2F at = { x, y };
+        rt->DrawTextLayout(at, l, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        l->Release();
+    }
+
     // ---- glyphs ----------------------------------------------------------------------
-    void glyph(int g, int slot, float cx, float cy, ControlState st) {
+    // Ink by state (TOOLBAR-SPEC 8.2): resting and selected use the accent, hover/press switch to
+    // textPrimary because accentGlyph only scores 3.0-3.6:1 on the hover/press surfaces.
+    void glyph(int g, int slot, float cx, float cy, ControlState st, ID2D1SolidColorBrush* resting = nullptr) {
         if (!rt || !th || !fac) return;
-        ID2D1SolidColorBrush* ink = (st == ST_DISABLED) ? brMuted
-                              : (st == ST_ACTIVE)       ? brAccent : brText;
+        ID2D1SolidColorBrush* def = resting ? resting : brAccent;
+        ID2D1SolidColorBrush* ink = (st == ST_DISABLED)  ? brMuted
+                              : (st == ST_HOVER || st == ST_PRESSED) ? brText
+                              : def;
         Geo geo = geometry_for(g, slot, cx, cy);
         if (geo.line) rt->DrawGeometry(geo.line, ink, th->strokeW, solid);
         if (geo.fill) rt->FillGeometry(geo.fill, ink);
@@ -271,6 +331,19 @@ public:
 
     static D2D1_ROUNDED_RECT R2rr(float x, float y, float w, float h, float rad) {
         D2D1_ROUNDED_RECT r; r.rect = R(x, y, w, h); r.radiusX = rad; r.radiusY = rad; return r;
+    }
+
+    // Measured width of a string in the format's own metrics. The pill sizes its labelled cells
+    // from this, so a longer caption changes the cell width instead of overflowing the pill.
+    float measure(const wchar_t* s, IDWriteTextFormat* fmt) const {
+        if (!dw_ || !fmt || !s || !*s) return 0.0f;
+        IDWriteTextLayout* l = nullptr;
+        if (FAILED(dw_->CreateTextLayout(s, (UINT)wcslen(s), fmt, 4000.0f, 200.0f, &l)) || !l)
+            return 0.0f;
+        DWRITE_TEXT_METRICS m;
+        l->GetMetrics(&m);
+        l->Release();
+        return m.widthIncludingTrailingWhitespace;
     }
 
     // Shared colored brushes, created once per color. Used by the editor for swatches and
@@ -363,19 +436,15 @@ private:
                 add_ellipse(s, cx, cy, h * 0.92f, h * 0.70f);
                 break;
             case G_MARKER: {
-                // Nib, body and the band it laid. Three separate shapes with a gap between the
-                // nib and the body; that gap plus the band is what stops this from reading as
-                // another slanted line.
+                // Only the body is stroked: two side edges and the far end, left open at the
+                // ferrule end. Filling this shape is what made the 0.1 glyph read as a blob.
                 MarkerShape m;
                 marker_shape(cx, cy, b, m);
-                const D2D1_POINT_2F* parts[3] = { m.nib, m.body, m.streak };
-                for (int i = 0; i < 3; ++i) {
-                    s->BeginFigure(parts[i][0], D2D1_FIGURE_BEGIN_HOLLOW);
-                    s->AddLine(parts[i][1]);
-                    s->AddLine(parts[i][2]);
-                    s->AddLine(parts[i][3]);
-                    s->EndFigure(D2D1_FIGURE_END_CLOSED);
-                }
+                s->BeginFigure(m.body[0], D2D1_FIGURE_BEGIN_HOLLOW);
+                s->AddLine(m.body[1]);
+                s->AddLine(m.body[2]);
+                s->AddLine(m.body[3]);
+                s->EndFigure(D2D1_FIGURE_END_OPEN);
                 break;
             }
             case G_CROP: {
@@ -488,9 +557,10 @@ private:
                 add_arc_head(s, arc_for(g, cx, cy, b), b);
                 break;
             case G_MARKER: {
+                // Head, ferrule and streak carry the mass; the body stays hollow (see build_line).
                 MarkerShape m;
                 marker_shape(cx, cy, b, m);
-                const D2D1_POINT_2F* parts[3] = { m.nib, m.body, m.streak };
+                const D2D1_POINT_2F* parts[3] = { m.nib, m.ferrule, m.streak };
                 for (int i = 0; i < 3; ++i) {
                     s->BeginFigure(parts[i][0], D2D1_FIGURE_BEGIN_FILLED);
                     s->AddLine(parts[i][1]);

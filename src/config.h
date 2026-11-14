@@ -55,6 +55,10 @@ struct Config {
     bool   copy_to_clipboard = true;
     std::wstring save_dir;         // empty -> Documents\Screenshots
     std::wstring name_format = L"screenshot_%Y-%m-%d_%H-%M-%S";
+    bool   save_ask = false;       // 1 = ask for the place and name on every Save
+    // default_save_dir() fills save_dir silently, so "the user has never picked a folder" cannot be
+    // read from save_dir.empty(); this flag is set only when save_dir= was really in the file (8.7).
+    bool   save_dir_chosen = false;
 
     static std::wstring path() {
         wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -83,8 +87,9 @@ struct Config {
             if (key == L"hotkey")           parse_hotkey(val, hotkey);
             else if (key == L"hotkey_window") parse_hotkey(val, hotkey_window);
             else if (key == L"clipboard")   copy_to_clipboard = (val == L"1");
-            else if (key == L"save_dir")    save_dir = val;
+            else if (key == L"save_dir")    { save_dir = val; save_dir_chosen = !val.empty(); }
             else if (key == L"name_format") name_format = val;
+            else if (key == L"save_ask")    save_ask = (val == L"1");
         }
         fclose(f);
         default_save_dir();
@@ -99,6 +104,7 @@ struct Config {
         fwprintf(f, L"hotkey_window=%ls\n", hotkey_window.to_text().c_str());
         fwprintf(f, L"clipboard=%d\n", copy_to_clipboard ? 1 : 0);
         fwprintf(f, L"save_dir=%ls\n", save_dir.c_str());
+        fwprintf(f, L"save_ask=%d\n", save_ask ? 1 : 0);
         fwprintf(f, L"name_format=%ls\n", name_format.c_str());
         fclose(f);
     }

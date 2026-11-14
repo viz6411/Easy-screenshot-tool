@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <dwmapi.h>
 #include <d2d1.h>
+#include <cmath>
 
 struct Theme {
     bool  dark = true;
@@ -63,6 +64,18 @@ struct Theme {
     }
     static float lum(const D2D1_COLOR_F& c) {
         return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+    }
+    // WCAG contrast ratio. lum() is a fast lightness for surfaces; contrast decisions that
+    // decide whether ink is readable must use the linearised sRGB form, otherwise a dark pair
+    // like #222222 on #1A1C20 scores ~1.07 instead of looking "close enough" to lum().
+    static float contrast(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b) {
+        auto lin = [](float v) { return v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f); };
+        auto L = [&](const D2D1_COLOR_F& c) {
+            return 0.2126f * lin(c.r) + 0.7152f * lin(c.g) + 0.0722f * lin(c.b);
+        };
+        float la = L(a), lb = L(b);
+        if (la < lb) { float t = la; la = lb; lb = t; }
+        return (la + 0.05f) / (lb + 0.05f);
     }
     static D2D1_COLOR_F mix(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t) {
         return D2D1_COLOR_F{ a.r + (b.r - a.r) * t,

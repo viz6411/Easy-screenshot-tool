@@ -2,6 +2,7 @@
 // Flow: global hotkey -> region overlay OR active-window capture -> annotation editor -> PNG + clipboard
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <vector>
 #include <string>
 #include <ctime>
@@ -113,6 +114,70 @@ static void notify(const wchar_t* msg) {
     int sw = GetSystemMetrics(SM_CXSCREEN);
     SetWindowPos(h, HWND_TOPMOST, sw - 480, 24, 460, 92, SWP_SHOWWINDOW);
 }
+
+// ---- output of the editor (card #8): these run while the editor window is open, because
+// "Сохранить"/"Копировать" must produce their result at the moment of the click.
+
+// System folder picker, modal with the editor as its owner (8.7 case 1).
+static std::wstring pick_folder(HWND owner) {
+    BROWSEINFOW bi = {};
+    bi.hwndOwner = owner;
+    bi.lpszTitle = L"Выбор папки для скриншотов";
+    // BIF_USENEWUI is the modern folder dialog with the "Folder:" edit field (8.7 case 1);
+    // MinGW's header has no BIF_NEWSSTYLEINTERFACE, and BIF_USENEWUI is the same UI.
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return L"";                       // "Отмена"
+    wchar_t path[MAX_PATH] = {};
+    bool ok = SHGetPathFromIDListW(pidl, path) != FALSE && path[0];
+    CoTaskMemFree(pidl);
+    return ok ? path : L"";
+}
+
+// "Сохранить как" for the save_ask=1 mode (8.7 case 4): the name is pre-filled from name_format.
+static std::wstring ask_file(HWND owner, const std::wstring& dir, const std::wstring& base) {
+    wchar_t file[MAX_PATH * 2] = {};
+    wcsncpy_s(file, (base + L".png").c_str(), _TRUNCATE);
+    wchar_t filter[] = L"PNG (*.png)\0*.png\0\0";
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = (DWORD)(sizeof(file) / sizeof(file[0]));
+    ofn.lpstrInitialDir = dir.empty() ? nullptr : dir.c_str();
+    ofn.lpstrDefExt = L"png";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetSaveFileNameW(&ofn)) return L"";     // "Отмена"
+    return file;
+}
+
+static Editor::OutputResult save_output(const DIB& out, HWND owner, std::wstring& path_out) {
+    std::wstring base = timestamp_name(g_cfg.name_format);
+    std::wstring file;
+
+    if (!g_cfg.save_dir_chosen) {                // never picked a folder: ask once, then remember it
+        std::wstring dir = pick_folder(owner);
+        if (dir.empty()) return Editor::OUT_CANCELLED;
+        g_cfg.save_dir = dir;
+        g_cfg.save_dir_chosen = true;
+        g_cfg.save();
+        file = unique_path(dir, base);
+    } else if (g_cfg.save_ask) {
+        file = ask_file(owner, g_cfg.save_dir, base);
+        if (file.empty()) return Editor::OUT_CANCELLED;
+    } else {
+        file = unique_path(g_cfg.save_dir, base);
+    }
+
+    path_out = file;
+    SHCreateDirectoryExW(owner, g_cfg.save_dir.c_str(), nullptr);
+    if (!png::write(file.c_str(), out.w, out.h, out.rgba)) return Editor::OUT_FAILED;
+    if (g_cfg.copy_to_clipboard) copy_dib_to_clipboard(out);
+    return Editor::OUT_SAVED;
+}
+
+static bool copy_output(const DIB& out) { return copy_dib_to_clipboard(out); }
 
 // Non-interactive self test: exercises capture -> crop -> annotate -> PNG -> clipboard.
 // Prints one line per step so a test harness can assert on it. Returns 0 on success.
@@ -271,34 +336,11 @@ static void do_capture(bool region_mode, const RECT* fixed_region = nullptr) {
         if (!h || !capture_window(h, img)) return;
     }
 
+    // Output belongs to the editor now: Save writes the file and Copy fills the clipboard at the
+    // moment of the click, both of them with the window still open (card #8).
     Editor ed;
-    bool completed = ed.run(img);
-    if (!completed) {                         // Esc or the close button: the capture is discarded
-        notify(L"Capture discarded - nothing was saved.");
-        return;
-    }
-    DIB out = ed.compose_result();            // captured pixels + committed annotations baked in
-
-    // The two exit buttons mean different things: Save writes a file, Copy goes to the clipboard
-    // only. Both bake the annotations into the pixels first.
-    bool want_file = !ed.copy_requested();
-    bool wrote = false;
-    std::wstring file;
-    if (want_file) {
-        file = unique_path(g_cfg.save_dir, timestamp_name(g_cfg.name_format));
-        wrote = png::write(file.c_str(), out.w, out.h, out.rgba);
-    }
-    bool to_clipboard = want_file ? g_cfg.copy_to_clipboard : true;
-    if (to_clipboard) copy_dib_to_clipboard(out);
-
-    wchar_t msg[512];
-    if (want_file && wrote)
-        wsprintfW(msg, L"Saved %ls%ls", file.c_str(), to_clipboard ? L"\nCopied to clipboard." : L"");
-    else if (want_file)
-        wsprintfW(msg, L"Failed to save screenshot.");
-    else
-        wsprintfW(msg, L"Copied to clipboard.");
-    notify(msg);
+    ed.set_output(save_output, copy_output);
+    if (!ed.run(img)) notify(L"Capture discarded - nothing was saved.");
 }
 
 static BOOL CALLBACK enum_top(HWND h, LPARAM l) {
