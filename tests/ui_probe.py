@@ -333,6 +333,8 @@ def swatch_boxes(fr, pill):
     """Colour swatches, found by clustering matching pixels into x-groups. Clustering matters:
     the annotation colour is also used for the line-width samples further along the pill, so
     matching a colour anywhere in the pill would merge the swatch with those samples."""
+    if pill is None:
+        raise RuntimeError('the pill was not found in the captured frame - the frame is in build/nopill-*.png')
     out = []
     for i, t in enumerate(PALETTE):
         tol = SWATCH_TOL[i]
@@ -607,11 +609,31 @@ WM_CHAR = 0x0102
 u.VkKeyScanW.restype = ctypes.c_short
 
 
-def grab_pill():
+regrabs = 0
+
+
+def grab_pill(tries=4):
     """A fresh screenshot of the editor together with the pill found in it - the two are always
-    wanted together, and a window that is gone or still painting gives (None, None)."""
-    fr = capture_window('ShotMvpEditor')
-    return fr, (find_pill(fr) if fr else None)
+    wanted together, and a window that is gone or still painting gives (None, None).
+
+    A frame captured a moment after the app repainted the pill can miss it: PrintWindow reads the
+    window's own buffer, and D2D is not always done writing it. Re-grabbing is legitimate here for
+    the same reason a human looks twice; every re-grab is counted, and a frame that never yields a
+    pill is written out to build/ so the eye can see what the app really painted."""
+    global regrabs
+    for i in range(tries):
+        fr = capture_window('ShotMvpEditor')
+        pill = find_pill(fr) if fr else None
+        if pill or not fr:
+            regrabs += i
+            return fr, pill
+        time.sleep(0.5)
+    try:
+        save_png('build/nopill-%s.png' % time.strftime('%H-%M-%S'), fr.w, fr.h, fr.rgb)
+    except Exception:
+        pass
+    regrabs += tries
+    return fr, None
 
 
 def click_chip(fr, pill, box):
@@ -651,6 +673,24 @@ def dialog_parts(dlg):
 
     walk(dlg, 0)
     return out
+
+
+def press_dialog_button(dlg, captions):
+    """Presses a shell dialog's own button by sending BM_CLICK to the button control.
+
+    Posted mouse and key messages go to the editor window, never to the modal dialog standing in
+    front of it: a posted Escape while the picker is open is delivered to the editor and closes it.
+    Captions are compared without the '&' mnemonic, in both languages this shell can show.
+    """
+    for h, cls, cap, r in dialog_parts(dlg):
+        if cls != 'Button':
+            continue
+        cap = cap.replace('&', '').strip().lower()
+        if any(c in cap for c in captions):
+            u.SendMessageW(h, 0x00F5, 0, 0)            # BM_CLICK
+            time.sleep(1.5)
+            return True
+    return False
 
 
 def save_png(path, w, h, rgb):
