@@ -24,18 +24,21 @@
 
 ## Сборка
 
-Нужен MinGW-w64 `g++` (C++17) и Python 3 для шага с манифестом и для тестов.
+Нужен MinGW-w64 `g++` (C++17) и `windres` (он же в составе MinGW-w64), Python 3 — только для тестов.
 
 ```powershell
 pwsh .\build.ps1            # build\ShotMvp.exe + build\ShotMvp_console.exe
 pwsh .\build.ps1 -Selftest  # и сразу встроенная диагностика
 ```
 
-`build.ps1` делает два вещи, которые важно не пропустить:
+`build.ps1` делает две вещи, которые важно не пропустить:
 
 1. `-municode -DUNICODE -D_UNICODE` — без них не линкуется точка входа `wWinMain` и ломаются
    wide-строки в `LoadCursorW`.
-2. `tools\replace_manifest.py` — вшивает манифест с `dpiAware=true/pm` в `.rsrc` обоих exe.
+2. `windres src\app.rc` — компилирует манифест `src\app.manifest` (`dpiAware=true`,
+   `dpiAwareness=PerMonitorV2`) как ресурс `RT_MANIFEST` id 1 и линкует его в оба exe. Раньше
+   манифест подменялся правкой готового бинарника (`tools\replace_manifest.py`, карточка #18) —
+   этот шаг убран, источник манифеста лежит в репозитории.
    Без манифеста Windows виртуализует координаты при масштабе экрана ≠ 100 %: оверлей перестаёт
    покрывать физический экран, а редактор считает размеры пилюли по чужому числу и рисует кашу.
 

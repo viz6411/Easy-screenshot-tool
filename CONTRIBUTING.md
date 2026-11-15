@@ -99,13 +99,17 @@
 
 ## 9. Сборка и проверки
 
-- Сборка: `pwsh build.ps1` (полная команда: `g++ -std=c++17 -O2 -municode -DUNICODE -D_UNICODE
-  src/main.cpp -o build/ShotMvp.exe -lgdi32 -luser32 -lshell32 -lole32 -ld2d1 -ldwrite -ldwmapi`
-  + `python tools/replace_manifest.py ShotMvp.exe ShotMvp_console.exe`). Перед сборкой снять
-  процессы `ShotMvp*`.
+- Сборка: `pwsh build.ps1` (полная команда: `windres -J rc -i src/app.rc -O coff -o
+  build/app_res.o -I src`, затем `g++ -std=c++17 -O2 -municode -DUNICODE -D_UNICODE
+  src/main.cpp build/app_res.o -o build/ShotMvp.exe -lgdi32 -luser32 -lshell32 -lole32 -ld2d1
+  -ldwrite -ldwmapi -lgdiplus`). Манифест DPI — ресурс из `src/app.rc` + `src/app.manifest`,
+  а не правка готового exe. Перед сборкой снять процессы `ShotMvp*`.
 - `python tests/stage1_states.py` — приёмка панели: геометрия, состояния, клики, полоса статуса,
   сквозной сценарий (exit 0 = PASS).
-- `python tests/dpi_verify.py` — оверлей закрывает весь физический экран.
+- `python tests/dpi_verify.py` — оверлей закрывает весь физический экран, окно редактора
+  признаётся Windows per-monitor DPI aware, выделение до правого нижнего угла сохраняется целиком.
+- `python tests/stage3_open_png.py` — открытие готового файла (`ShotMvp.exe file.png`),
+  побайтовая целостность «открыл → сохранил» и вес полного кадра (карточки #16 #17).
 - `python tools/icon_sheet.py build/icon-sheet.png` — увеличенный лист иконок: читаемость глифов
   проверяется по нему, а не по общему скриншоту.
 - Все Python-зонды обязаны быть per-monitor DPI aware (`ui_probe.make_probe_dpi_aware()`); метрики

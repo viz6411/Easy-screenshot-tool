@@ -1,5 +1,4 @@
 param(
-    [switch]$NoManifest,   # skip the DPI manifest step (not recommended)
     [switch]$Selftest      # run the built-in DPI/capture self test afterwards
 )
 $ErrorActionPreference = 'Stop'
@@ -19,20 +18,21 @@ $src    = Join-Path $root 'src\main.cpp'
 $gui    = Join-Path $out 'ShotMvp.exe'
 $console = Join-Path $out 'ShotMvp_console.exe'
 
-g++ @common '-mwindows' $src -o $gui @libs
+# The per-monitor DPI manifest is compiled into the exe as a real resource (RT_MANIFEST, id 1).
+# It used to be patched into the finished binary by a Python script that also read its XML from
+# outside the repository; building it is what makes DPI awareness part of the build (#18).
+# Without the manifest Windows virtualises coordinates at non-100% scaling: the overlay stops
+# covering the physical screen and the editor sizes its layout from the wrong number.
+$res = Join-Path $out 'app_res.o'
+windres '-J' 'rc' '-i' (Join-Path $root 'src\app.rc') '-O' 'coff' '-o' $res '-I' (Join-Path $root 'src')
+if ($LASTEXITCODE) { throw "windres failed for $res" }
+
+g++ @common '-mwindows' $src $res -o $gui @libs
 if ($LASTEXITCODE) { throw "build of $gui failed" }
 
 # Console variant: the same program, so -selftest output can be read from a terminal.
-g++ @common $src -o $console @libs
+g++ @common $src $res -o $console @libs
 if ($LASTEXITCODE) { throw "build of $console failed" }
-
-# The per-monitor DPI manifest must live inside the .rsrc of every build that shows a window.
-# Without it Windows virtualises coordinates at non-100% scaling: the overlay stops covering the
-# physical screen and the editor sizes its layout from the wrong number.
-if (-not $NoManifest) {
-    python (Join-Path $root 'tools\replace_manifest.py') $gui $console
-    if ($LASTEXITCODE) { throw "manifest patch failed" }
-}
 
 Write-Host "built $gui"
 if ($Selftest) { & $gui -selftest }

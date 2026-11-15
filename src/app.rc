@@ -1,0 +1,4 @@
+// RT_MANIFEST (24) under id 1 is the assembly manifest the loader reads out of the exe. Compiling
+// it here is what makes per-monitor DPI awareness part of the build; it used to be a byte patch of
+// the finished binary (card #18).
+1 24 "app.manifest"
