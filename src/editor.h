@@ -92,7 +92,7 @@ public:
         // Captions are measured through DirectWrite, which needs the text formats, which need the
         // window; so the first pass sizes the window from the caption-free layout and fit_window()
         // corrects it once the real caption widths are known.
-        fit_ = FIT_PLAIN_1ROW;
+        fit_ = FIT_PLAIN_1;          // the narrowest layout until fit_window() measures the real one
         labels_ = false;
         build_slots();
         int scrW = GetSystemMetrics(SM_CXSCREEN), scrH = GetSystemMetrics(SM_CYSCREEN);
@@ -185,17 +185,27 @@ private:
     int PAD = 16, PAD_TOP = 8, PAD_BOTTOM = 12, FOOT_H = 26;
     int pill_w_ = 0;
     float pill_x_ = 0, pill_y_ = 0, pill_h_ = 0;
+    // One geometry shared by painting and hit-testing: the band the picture may occupy and the top
+    // edge of the status strip that bounds it from below (card #24).
+    float strip_y_ = 0, img_top_ = 0, img_bottom_ = 0;
+    bool strip_hidden_ = false, growing_ = false;
     std::vector<Slot> slots_;
     std::wstring group_caption_[GRP_COUNT];
-    float grp_x_[2][GRP_COUNT] = {};      // left edge of a group on a row, -1 when absent
-    float grp_w_[2][GRP_COUNT] = {};
+    static const int MAX_ROWS = 3;                 // the toolbar reflows to at most three rows (#24)
+    float grp_x_[MAX_ROWS][GRP_COUNT] = {};        // left edge of a group on a row, -1 when absent
+    float grp_w_[MAX_ROWS][GRP_COUNT] = {};
 
     // Fit levels, richest first: labels on one row, labels wrapped to two rows, then the same
     // without captions. Every level is measured from the real client width, so the pill adapts
     // to the monitor instead of assuming a 2560-wide calibrated display.
-    enum Fit { FIT_LABELS_1ROW = 0, FIT_LABELS_2ROW, FIT_PLAIN_1ROW, FIT_PLAIN_2ROW };
-    Fit fit_ = FIT_LABELS_1ROW;
-    float fit_w_[4] = { 0, 0, 0, 0 };
+    // Six layouts: captions on/off x 1..3 rows (docs/WIN11-UI-GUIDE.md R9). Every level caches the
+    // partition of the five groups that makes its widest row as narrow as possible, so the pill is
+    // never wider than the window that shows it - that is what broke when the window was resized
+    // (card #24).
+    enum Fit { FIT_CAP_1 = 0, FIT_CAP_2, FIT_CAP_3, FIT_PLAIN_1, FIT_PLAIN_2, FIT_PLAIN_3 };
+    static const int LEVELS = 6;
+    Fit fit_ = FIT_CAP_1;
+    float fit_w_[LEVELS] = { 0, 0, 0, 0, 0, 0 };
     int pill_min_ = 0;
     bool labels_ = true;
 
@@ -216,8 +226,8 @@ private:
         return signed_cell ? theme_.ctlH + 2 * theme_.s4 + 2 * caption_line() : theme_.ctlH;
     }
     int cell_h() const { return cell_h_for(labels_); }
-    int rows_() const { return (fit_ == FIT_LABELS_2ROW || fit_ == FIT_PLAIN_2ROW) ? 2 : 1; }
-    static bool fit_has_labels(int f) { return f <= FIT_LABELS_2ROW; }
+    int rows_() const { return (fit_ % MAX_ROWS) + 1; }
+    static bool fit_has_labels(int f) { return f <= FIT_CAP_3; }
 
     // ---- messages ----------------------------------------------------------------------
     LRESULT on_msg(HWND h, UINT m, WPARAM wp, LPARAM lp) {
@@ -241,6 +251,7 @@ private:
                 apply_metric_padding();
                 cv_.shutdown();                       // text formats carry the old font sizes
                 cv_.init(rt_, factory_, dwrite_, &theme_);
+                measure_fits();                       // every cached measurement is DPI-scaled (R5)
                 layout();
                 InvalidateRect(h, nullptr, TRUE);
                 return 0;
@@ -273,13 +284,18 @@ private:
 
             case WM_GETMINMAXINFO: {
                 MINMAXINFO* mmi = (MINMAXINFO*)lp;
-                // The floor is the narrowest pill the layout can produce (level 4), never the pill
-                // of the current level: flooring it at the labelled width would forbid a window
-                // 2189 px wide and make the two-row level unreachable (8.1 p.4).
+                // Both floors come from what the layout can actually draw (WIN11-UI-GUIDE R6): the
+                // narrowest pill (captions off, three rows) and a height that still fits the tallest
+                // toolbar this width can select plus the status strip.
                 int pill_floor = pill_min_ ? pill_min_ : pill_w_;
                 mmi->ptMinTrackSize.x = (std::max)(420 + frame_w_,
                                                    (pill_floor + theme_.s24 + 16) + frame_w_);
-                mmi->ptMinTrackSize.y = 240;
+                int shortest = pill_h_for(FIT_PLAIN_1);
+                for (int f = 0; f < LEVELS; ++f)
+                    if (fit_w_[f] + 2 * theme_.s8 <= mmi->ptMinTrackSize.x - frame_w_ &&
+                        pill_h_for(f) < shortest) shortest = pill_h_for(f);
+                mmi->ptMinTrackSize.y = (std::max)(240, shortest + FOOT_H + theme_.s12 + PAD_TOP +
+                                                    PAD_BOTTOM + frame_h_);
                 return 0;
             }
 
@@ -507,42 +523,66 @@ private:
         return w;
     }
 
-    // The split that makes the wider of the two rows as short as possible.
-    int best_split(const std::vector<Grp>& gs) const {
-        int best = 1;
-        float bestMax = 1e9f;
-        for (int b = 0; b < GRP_COUNT - 1; ++b) {
-            float a = row_width(gs, 0, b), c = row_width(gs, b + 1, GRP_COUNT - 1);
-            float m = (std::max)(a, c);
-            if (m < bestMax) { bestMax = m; best = b; }
+    // Where the groups break into rows so that the widest row is as narrow as possible. Five groups
+    // is small enough to try every contiguous break (C(4,rows-1) combinations) once per DPI.
+    struct Partition {
+        float widest = 0;
+        int rows = 1;
+        int start[MAX_ROWS + 1] = { 0 };    // group index where each row begins, last entry = GRP_COUNT
+    };
+
+    Partition best_partition(const std::vector<Grp>& gs, int rows) const {
+        Partition best; best.rows = rows; best.widest = 1e18f;
+        auto consider = [&](Partition p) {
+            p.widest = 0;
+            for (int r = 0; r < p.rows; ++r)
+                p.widest = (std::max)(p.widest, row_width(gs, p.start[r], p.start[r + 1] - 1));
+            if (p.widest < best.widest) best = p;
+        };
+        Partition p = {}; p.start[0] = 0;
+        if (rows == 1) { p.rows = 1; p.start[1] = GRP_COUNT; consider(p); return best; }
+        for (int a = 1; a < GRP_COUNT; ++a) {
+            Partition q = p; q.rows = 2; q.start[1] = a; q.start[2] = GRP_COUNT;
+            if (rows == 2) { consider(q); continue; }
+            for (int b = a + 1; b < GRP_COUNT; ++b) {
+                Partition t = q; t.rows = 3; t.start[2] = b; t.start[3] = GRP_COUNT;
+                consider(t);
+            }
         }
         return best;
     }
 
-    float pill_width_for(const std::vector<Grp>& gs, int split, bool two_rows) const {
-        float pad = 2.0f * theme_.s12;
-        if (!two_rows) return row_width(gs, 0, GRP_COUNT - 1) + pad;
-        return (std::max)(row_width(gs, 0, split), row_width(gs, split + 1, GRP_COUNT - 1)) + pad;
-    }
+    float pill_width_for(const Partition& p) const { return p.widest + 2.0f * theme_.s12; }
 
-    // Measures all four layouts. Needs the text formats, so it runs after the D2D target exists.
+    Partition parts_[LEVELS];
+
+    // Measures all six layouts. Needs the text formats, so it runs after the D2D target exists - and
+    // again whenever the DPI changes, because every number here is DPI-scaled (R2/R5).
     void measure_fits() {
-        for (int f = 0; f < 4; ++f) {
+        for (int f = 0; f < LEVELS; ++f) {
             std::vector<Grp> gs = build_groups(fit_has_labels(f));
-            fit_w_[f] = pill_width_for(gs, best_split(gs), f == FIT_LABELS_2ROW || f == FIT_PLAIN_2ROW);
+            parts_[f] = best_partition(gs, (f % MAX_ROWS) + 1);
+            fit_w_[f] = pill_width_for(parts_[f]);
         }
-        pill_min_ = (int)fit_w_[FIT_PLAIN_2ROW];
+        pill_min_ = (int)fit_w_[FIT_PLAIN_3];
     }
 
-    Fit fit_for(int client_w) const {
-        for (int f = 0; f < 4; ++f)
-            if (fit_w_[f] + 2.0f * theme_.s8 <= (float)client_w) return (Fit)f;
-        return FIT_PLAIN_2ROW;      // nothing fits: draw the narrowest layout and let the window
-                                    // min-track size stop the user from shrinking it further
+    // The richest layout that fits BOTH the width and the height this window has: the toolbar may
+    // reflow, it may not stick out of the window and it may not cover the status strip (#24).
+    Fit fit_for(int client_w, int client_h) const {
+        int shortestW = -1;
+        for (int f = 0; f < LEVELS; ++f) {
+            if (fit_w_[f] + 2.0f * theme_.s8 > (float)client_w) continue;
+            if (shortestW < 0 || pill_h_for(f) < pill_h_for(shortestW)) shortestW = f;
+            if (theme_.s12 + pill_h_for(f) + FOOT_H <= client_h) return (Fit)f;
+        }
+        // Nothing fits vertically either: keep the commands visible with the shortest toolbar and
+        // let layout() grow the window back (R6 - the min-track size normally forbids this case).
+        return shortestW >= 0 ? (Fit)shortestW : (Fit)FIT_PLAIN_3;
     }
 
     int pill_h_for(int f) const {
-        int rows = (f == FIT_LABELS_2ROW || f == FIT_PLAIN_2ROW) ? 2 : 1;
+        int rows = (f % MAX_ROWS) + 1;
         int cell = cell_h_for(fit_has_labels(f));
         return rows * cell + (rows + 1) * theme_.s6;
     }
@@ -552,8 +592,8 @@ private:
     // compared against the client width the screen actually allows.
     void fit_window(int scrW, int scrH, int frameW, int frameH) {
         measure_fits();
-        int chosen = FIT_PLAIN_2ROW;
-        for (int f = 0; f < 4; ++f) {
+        int chosen = FIT_PLAIN_3;
+        for (int f = 0; f < LEVELS; ++f) {
             int wantClientW = (std::max)(img_.w + 2 * PAD, (int)fit_w_[f] + theme_.s24);
             int winW = (std::min)(wantClientW + frameW, scrW - 8);
             if ((int)fit_w_[f] + 2 * theme_.s8 <= winW - frameW) { chosen = f; break; }
@@ -575,18 +615,19 @@ private:
     void build_slots() {
         slots_.clear();
         labels_ = fit_has_labels(fit_);
-        bool two = rows_() == 2;
+        int rows = (fit_ % MAX_ROWS) + 1;
         std::vector<Grp> gs = build_groups(labels_);
-        int split = best_split(gs);
-        pill_w_ = (int)(pill_width_for(gs, split, two) + 0.5f);
-        pill_h_ = (float)(rows_() * cell_h() + (rows_() + 1) * theme_.s6);
+        // Re-partition for the groups as they are right now: the property group swaps its caption
+        // with the tool, so a partition measured earlier is not necessarily the narrowest today.
+        Partition p = best_partition(gs, rows);
+        pill_w_ = (int)(pill_width_for(p) + 0.5f);
+        pill_h_ = (float)(rows * cell_h() + (rows + 1) * theme_.s6);
 
         const float cellH = (float)cell_h();
-        for (int r = 0; r < 2; ++r) for (int g = 0; g < GRP_COUNT; ++g) grp_x_[r][g] = -1.0f;
-        for (int r = 0; r < (two ? 2 : 1); ++r) {
-            // One row carries every group; only the two-row level uses the split point.
-            int from = r == 0 ? 0 : split + 1;
-            int to = two ? (r == 0 ? split : GRP_COUNT - 1) : GRP_COUNT - 1;
+        for (int r = 0; r < MAX_ROWS; ++r) for (int g = 0; g < GRP_COUNT; ++g) grp_x_[r][g] = -1.0f;
+        for (int r = 0; r < p.rows; ++r) {
+            int from = p.start[r];
+            int to = (r + 1 < p.rows ? p.start[r + 1] : GRP_COUNT) - 1;
             float span = row_width(gs, from, to);
             float x = (pill_w_ - span) / 2.0f;              // each row is centred in the pill
             float rowTop = (float)(r * (cell_h() + theme_.s6));
@@ -617,15 +658,31 @@ private:
     void layout() {
         if (!hwnd_) return;
         RECT cr; GetClientRect(hwnd_, &cr);
-        int cw = cr.right - cr.left;
+        int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
         const Theme& t = theme_;
 
-        fit_ = fit_for(cw);
+        fit_ = fit_for(cw, ch);
         labels_ = fit_has_labels(fit_);
         build_slots();                          // rows are already centred inside the pill
         pill_x_ = (float)((cw - pill_w_) / 2);
         pill_y_ = (float)t.s12;
         for (auto& s : slots_) { s.x += pill_x_; s.y += pill_y_ + t.s6; }
+
+        // A window shorter than this toolbar + strip is not something the layout can draw, so grow
+        // it back once (R6). growing_ keeps the WM_SIZE this triggers from looping.
+        if (pill_y_ + pill_h_ + (float)FOOT_H > (float)ch && !growing_) {
+            growing_ = true;
+            int need = (std::min)((int)(pill_y_ + pill_h_ + FOOT_H + t.s6) + frame_h_,
+                                  GetSystemMetrics(SM_CYSCREEN) - 8);
+            SetWindowPos(hwnd_, nullptr, 0, 0, cw + frame_w_, need, SWP_NOMOVE | SWP_NOZORDER);
+            growing_ = false;
+            GetClientRect(hwnd_, &cr);
+            ch = cr.bottom - cr.top;
+        }
+        strip_hidden_ = pill_y_ + pill_h_ + (float)FOOT_H > (float)ch;
+        strip_y_ = (float)(ch - FOOT_H);
+        img_top_ = pill_y_ + pill_h_ + (float)PAD_TOP;
+        img_bottom_ = (std::max)(img_top_, strip_y_ - (float)PAD_BOTTOM);
     }
 
     // The property group belongs to the tool: line widths for a stroke, the three backdrops for
@@ -650,11 +707,13 @@ private:
         rt_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
         // 1. The captured pixels, centred under the pill, with a hairline outline so the
-        //    edges of a screenshot read cleanly against the dark canvas.
+        //    edges of a screenshot read cleanly against the dark canvas. The picture and everything
+        //    drawn on it are clipped to the band between the pill and the strip: shrinking the
+        //    window used to slide them under the toolbar and under the strip (card #24).
         float imgX = (float)((int)((W - img_.w) / 2));
-        if (imgX < t.s8) imgX = (float)t.s8;
-        float imgY = pill_y_ + pill_h_ + (float)PAD_TOP;
+        float imgY = img_top_;
         img_org_x_ = (int)imgX; img_org_y_ = (int)imgY;
+        rt_->PushAxisAlignedClip(ui::R(0.0f, imgY, W, img_bottom_ - imgY), D2D1_ANTIALIAS_MODE_ALIASED);
 
         if (img_bitmap_) {
             D2D1_RECT_F dst = ui::R(imgX, imgY, (float)img_.w, (float)img_.h);
@@ -676,13 +735,18 @@ private:
             rt_->DrawRoundedRectangle(&rr, cv_.brAccent, 2.0f, cv_.solid);
         }
 
+        rt_->PopAxisAlignedClip();
+
         // 3. The pill.
         paint_pill();
 
         // 4. Status strip: its top edge IS the separator (card #9), the image bottom sits
         //    PAD_BOTTOM above it, and every string of the strip lies below it.
-        float stripY = H - (float)FOOT_H;
-        rt_->DrawLine(D2D1_POINT_2F{ (float)t.s16, stripY },
+        // With no vertical room for the strip (only possible if WM_GETMINMAXINFO was bypassed) the
+        // strip is moved off the target instead of being painted over the toolbar.
+        float stripY = strip_hidden_ ? (float)H + 400.0f : strip_y_;
+        if (!strip_hidden_)
+            rt_->DrawLine(D2D1_POINT_2F{ (float)t.s16, stripY },
                       D2D1_POINT_2F{ W - (float)t.s16, stripY }, cv_.brSoft);
         if (cv_.fmtCaption) {
             float ty = stripY + (float)t.s6, th = (float)(FOOT_H - 2 * t.s6);
@@ -1051,6 +1115,10 @@ private:
             }
         }
 
+        // Card #24: under the visible band there is no picture to draw on. Strokes started there
+        // used to be invisible on screen and still ended up in the exported file.
+        if (!on_visible_image(mx, my)) return;
+
         if (tool_ == TOOL_CROP) {
             crop_active_ = true;
             crop_a_ = { imgX(mx), imgY(my) };
@@ -1186,6 +1254,11 @@ private:
         }
         if (pressed == ID_DROP) { discard_confirmed_ = true; return true; }
         return false;
+    }
+
+    // The band the picture actually occupies on screen: between the pill and the strip.
+    bool on_visible_image(int mx, int my) const {
+        return (float)my >= img_top_ && (float)my <= img_bottom_;
     }
 
     void on_move(int mx, int my) {

@@ -234,27 +234,48 @@ def capture_window(class_prefix):
 
 
 # ------------------------------------------------------------ measurement -------------------
-def find_pill(fr, max_row=220):
-    """The pill is the widest run of the floating surface colour near the top. Its height comes
-    from a column inside the pill's own left padding - scanning rows by colour would let the
-    captured screenshot below it extend the box."""
-    best = (0, 0, 0)
-    for y in range(15, min(fr.h, max_row)):
-        for s, e, ln in fr.runs(y, lambda c: near(c, FLOATING, 5), 1, fr.w - 1):
-            if ln > best[0]: best = (ln, y, s)
-    runlen, ry, rx0 = best
-    if runlen < fr.w * 0.3:
+def find_pill(fr, max_row=460):
+    """The pill's rectangle as it was painted, measured from the surface it is filled with.
+
+    Anchors (WIN11-UI-GUIDE R8, card #24): the toolbar is the topmost band of floating surface in
+    the client area; it is contiguous, and its innermost row is at least 55 % of the client width
+    at every window size, because the layout reflows instead of shrinking below its own content.
+    Rows above and below it are canvas, which is a different colour, so walking up and down from
+    the first qualifying row reaches the pill's own top and bottom edges.
+    """
+    cx0, cy0, cw, ch = getattr(fr, 'client', (8, 0, fr.w - 16, fr.h))
+    ok = lambda c: near(c, FLOATING, 5)
+
+    def row_runs(y, x0, x1):
+        return [r for r in fr.runs(y, ok, max(cx0, x0), min(cx0 + cw, x1)) if r[2] >= 20]
+
+    ry = 0
+    for y in range(cy0 + 4, min(cy0 + ch, cy0 + max_row)):
+        if row_runs(y, cx0, cx0 + cw):
+            ry = y
+            break
+    if not ry:
         return None
-    xs = [x for x in range(max(0, rx0 - 400), min(fr.w, rx0 + runlen + 400))
-          if near(fr.at(x, ry), FLOATING, 5)]
-    x0, x1 = min(xs), max(xs)
-    probe = x0 + 14
-    vert = fr.col_runs(probe, lambda c: near(c, FLOATING, 5), max(0, ry - 120), min(fr.h, ry + 240), 20)
-    if not vert:
+    rs = row_runs(ry, cx0, cx0 + cw)
+    x0, x1 = rs[0][0], rs[-1][1]
+
+    # Height: the anchor row is the pill's top padding row, so it spans the whole inner width and
+    # x0..x1 are the pill's inner edges. Walking up and down at every 4th column gives the span:
+    # a column a control happens to cover only shortens its own span, and the widest span wins.
+    top, bot = ry, ry
+    for px in range(x0 + 2, max(x0 + 3, x1 - 1), 4):
+        t = ry
+        while t - 1 > cy0 and ok(fr.at(px, t - 1)):
+            t -= 1
+        b = ry
+        while b + 1 < cy0 + ch and ok(fr.at(px, b + 1)):
+            b += 1
+        if b - t > bot - top:
+            top, bot = t, b
+    if top - cy0 > 60:                        # the toolbar is at the top of the client, or this is not it
         return None
-    y0, y1, _ = max(vert, key=lambda r: r[2])
-    return {'x0': x0, 'x1': x1, 'y0': y0, 'y1': y1, 'cy': (y0 + y1) // 2,
-            'w': x1 - x0 + 1, 'h': y1 - y0 + 1}
+    return {'x0': x0, 'x1': x1, 'y0': top, 'y1': bot, 'cy': (top + bot) // 2,
+            'w': x1 - x0 + 1, 'h': bot - top + 1}
 
 
 CHIP_TOP, CHIP_BOTTOM = 8, 70      # rows of the chip square inside the pill; the caption band is
@@ -612,7 +633,7 @@ u.VkKeyScanW.restype = ctypes.c_short
 regrabs = 0
 
 
-def grab_pill(tries=4):
+def grab_pill(tries=4, max_row=460):
     """A fresh screenshot of the editor together with the pill found in it - the two are always
     wanted together, and a window that is gone or still painting gives (None, None).
 
@@ -623,7 +644,7 @@ def grab_pill(tries=4):
     global regrabs
     for i in range(tries):
         fr = capture_window('ShotMvpEditor')
-        pill = find_pill(fr) if fr else None
+        pill = find_pill(fr, max_row) if fr else None
         if pill or not fr:
             regrabs += i
             return fr, pill
