@@ -444,9 +444,19 @@ static int run_mode(const Args& a) {
 
     if (a.selftest) return run_selftest();
 
+    // Card #16: ShotMvp.exe file.png opens that file in the editor. No capture hotkeys here -
+    // the process exists when the editing window closes, so it does not compete for a global key.
     if (a.open_file && !a.path.empty()) {
-        MessageBoxW(nullptr, L"Opening existing files is not in this MVP build yet.\nUse the capture hotkey.",
-                    L"ShotMvp", MB_OK | MB_ICONINFORMATION);
+        DIB img;
+        if (!png::read(a.path.c_str(), img)) {
+            wchar_t msg[512];
+            wsprintfW(msg, L"Cannot open this file:\n%ls", a.path.c_str());
+            MessageBoxW(nullptr, msg, L"ShotMvp", MB_OK | MB_ICONWARNING);
+            return 1;
+        }
+        Editor ed;
+        ed.set_output(save_output, copy_output);
+        if (!ed.run(img)) notify(L"Editing discarded - nothing was saved.");
         return 0;
     }
 
