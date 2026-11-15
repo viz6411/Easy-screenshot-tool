@@ -13,7 +13,7 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 Get-Process -Name ShotMvp* -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
 
 $common = @('-std=c++17', '-O2', '-municode', '-DUNICODE', '-D_UNICODE')
-$libs   = @('gdi32', 'user32', 'shell32', 'ole32', 'comdlg32', 'd2d1', 'dwrite', 'dwmapi', 'gdiplus') | ForEach-Object { "-l$_" }
+$libs   = @('gdi32', 'user32', 'shell32', 'ole32', 'comdlg32', 'comctl32', 'd2d1', 'dwrite', 'dwmapi', 'gdiplus') | ForEach-Object { "-l$_" }
 $src    = Join-Path $root 'src\main.cpp'
 $gui    = Join-Path $out 'ShotMvp.exe'
 $console = Join-Path $out 'ShotMvp_console.exe'

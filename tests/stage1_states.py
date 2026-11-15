@@ -148,12 +148,19 @@ check('the default tool is marked active', st[0] == 'active', 'slot 1 = %s' % st
 check('exactly one tool is active at start', st.count('active') == 1, str(st))
 check('one line width is active', ws.count('active') == 1, str(ws))
 check('undo/redo read as recessed at start', his == ['disabled', 'disabled'], str(his))
-check('copy/save read as available', out == ['normal', 'normal'], str(out))
+# Fill only: both output controls rest on the recess surface, so this line says nothing about
+# whether Save is live (card #22 makes it a hole until something is edited - measured by outline).
+check('copy and save rest on the recessed output surface', out == ['normal', 'normal'], str(out))
+save_hole = P.outline_length(fr, pill, output[1])
+check('Save is drawn as a hole while nothing has been edited', save_hole <= 3,
+      'Save outline %d px (a live niche is 40 px, card #22)' % save_hole)
 # A recessed control and a disabled control are both the canvas colour; what tells them apart is
 # the outline around the niche (8.2), measured against the surface the outline sits on (8.8).
-niche = [P.outline_length(fr, pill, b) for b in output]
+niche = [P.outline_length(fr, pill, b) for b in output[:1]]   # «Копировать»: the always-live output control
 holes = [P.outline_length(fr, pill, b) for b in history]
 print('   outline hairline : output %s px, history %s px' % (niche, holes))
+# shortcut: «Сохранить» is left out here on purpose - on a capture without edits it is a hole by
+# card #22, and that state is what tests/stage4_unsaved.py measures.
 check('the output niches are drawn as niches, the disabled history controls are not',
       min(niche) >= 25 and max(holes) <= 8, 'output %s vs history %s' % (niche, holes))
 

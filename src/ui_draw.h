@@ -260,6 +260,9 @@ public:
                 fillc = th->canvas;
                 if (st == ST_HOVER) fillc = th->control;
                 else if (st == ST_PRESSED) fillc = th->controlPressed;
+                // Card #22: a disabled control in the output niche is a hole - the same sign the
+                // history group uses (TOOLBAR-SPEC 8.5), so the recess outline goes away with it.
+                else if (st == ST_DISABLED) no_border = true;
                 break;
             default:
                 if (st == ST_HOVER) fillc = th->controlHover;

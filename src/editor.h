@@ -14,6 +14,7 @@
 #include <initguid.h>
 #include <d2d1.h>
 #include <dwrite.h>
+#include <commctrl.h>
 #include <vector>
 #include <string>
 #include <cmath>
@@ -151,6 +152,9 @@ public:
     void set_output(SaveFn s, CopyFn c) { save_fn_ = s; copy_fn_ = c; }
 
     bool produced() const { return produced_; }
+    // Card #22: the editor already asked "Сохранить / Не сохранять / Отмена" and the answer was
+    // "Не сохранять". main.cpp must not announce a discarded capture on top of that answer.
+    bool discard_confirmed() const { return discard_confirmed_; }
 
     // Bake committed strokes into the image so the saved PNG contains them (image-space px).
     DIB compose_result() {
@@ -204,7 +208,14 @@ private:
     }
 
     int caption_line() const { return theme_.fsCaption * 4 / 3; }
-    int cell_h() const { return labels_ ? theme_.ctlH + theme_.s4 + caption_line() : theme_.ctlH; }
+    // A signed cell carries two caption bands: the group's own line on top, the control's caption
+    // under it (card #22 needs a caption in the output group, and the group caption has never had
+    // a row of its own). `pill_h_for` below must use this same function - the two numbers are the
+    // pill height and the row positions, and if they disagree the rows slide out of the pill.
+    int cell_h_for(bool signed_cell) const {
+        return signed_cell ? theme_.ctlH + 2 * theme_.s4 + 2 * caption_line() : theme_.ctlH;
+    }
+    int cell_h() const { return cell_h_for(labels_); }
     int rows_() const { return (fit_ == FIT_LABELS_2ROW || fit_ == FIT_PLAIN_2ROW) ? 2 : 1; }
     static bool fit_has_labels(int f) { return f <= FIT_LABELS_2ROW; }
 
@@ -252,6 +263,13 @@ private:
             case WM_KEYDOWN:     on_key((int)wp); return 0;
             case WM_KEYUP:       on_key_up((int)wp); return 0;
             case WM_CHAR:        on_char((wchar_t)wp); return 0;
+
+            // Card #22: one closing path only - the cross and Esc both end up here, so the unsaved
+            // question cannot be avoided by choosing the other way out.
+            case WM_CLOSE:
+                if (dirty_ && !ask_discard()) return 0;    // "Отмена": the window stays open
+                DestroyWindow(h);
+                return 0;
 
             case WM_GETMINMAXINFO: {
                 MINMAXINFO* mmi = (MINMAXINFO*)lp;
@@ -453,12 +471,25 @@ private:
         add(*og, 2, ui::G_COPY, TOOL_ARROW, 0, 0, acts[0], with_labels ? output_caption(0) : nullptr);
         add(*og, 3, ui::G_SAVE, TOOL_ARROW, 0, 0, acts[1], with_labels ? output_caption(1) : nullptr);
 
+        // Card #22: the output group carries its own caption - whether the edits are still unsaved.
+        // Its width is reserved whatever `dirty_` currently says, so flipping the state must not
+        // resize the pill (a pill that changes width mid-session re-flows every control under the
+        // pointer).
+        const wchar_t* out_dirty_cap = L"есть несохранённые правки";
+        const wchar_t* out_clean_cap = L"нет несохранённых правок";
+        if (with_labels) {
+            float cap_w = (std::max)(cv_.measure(out_dirty_cap, cv_.fmtCaption),
+                                     cv_.measure(out_clean_cap, cv_.fmtCaption));
+            float grp_w = 2.0f * out_cap + 4.0f * t.s4 + (float)t.s6;
+            if (cap_w > grp_w) out_cap = (cap_w - (float)t.s6 - 4.0f * t.s4) / 2.0f;
+        }
+
         group_caption_[GRP_TOOLS] = L"";
         group_caption_[GRP_COLORS] = with_labels ? L"Цвет" : L"";
         group_caption_[GRP_PROPS] = with_labels
             ? (tool_ == TOOL_TEXT ? L"Фон" : L"Толщина") : L"";
         group_caption_[GRP_HISTORY] = L"";
-        group_caption_[GRP_OUTPUT] = L"";
+        group_caption_[GRP_OUTPUT] = with_labels ? (dirty_ ? out_dirty_cap : out_clean_cap) : L"";
 
         for (auto& gr : gs) {
             int n = (int)gr.slots.size();
@@ -512,7 +543,7 @@ private:
 
     int pill_h_for(int f) const {
         int rows = (f == FIT_LABELS_2ROW || f == FIT_PLAIN_2ROW) ? 2 : 1;
-        int cell = fit_has_labels(f) ? theme_.ctlH + theme_.s4 + caption_line() : theme_.ctlH;
+        int cell = cell_h_for(fit_has_labels(f));
         return rows * cell + (rows + 1) * theme_.s6;
     }
 
@@ -729,7 +760,8 @@ private:
                 }
 
                 case KIND_ACTION: {
-                    bool off = (s.action == 0 && undo_.empty()) || (s.action == 1 && redo_.empty());
+                    bool off = (s.action == 0 && undo_.empty()) || (s.action == 1 && redo_.empty()) ||
+                               (s.action == 3 && !edited_);  // card #22: nothing edited, nothing to save
                     ui::ControlState st = off ? ui::ST_DISABLED : state_of(s);
                     cv_.control(cx, s.y, (float)t.ctlH, (float)t.ctlH, st, group_of(s));
                     // History has no accent state, but its resting glyph is the accent (8.2); output
@@ -820,8 +852,11 @@ private:
                 }
             }
 
+            // Second caption band: the control's own caption, under the group caption of the first
+            // band (card #22). In the unsigned levels captions are empty and nothing moves.
             if (!s.caption.empty() && cv_.fmtCaption)
-                cv_.draw_layout(s.caption.c_str(), cv_.fmtCaption, s.x, s.y + t.ctlH + t.s4,
+                cv_.draw_layout(s.caption.c_str(), cv_.fmtCaption, s.x,
+                                s.y + t.ctlH + t.s4 + capH + t.s4,
                                 s.w, capH, cap_br, DWRITE_TEXT_ALIGNMENT_CENTER,
                                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         }
@@ -833,8 +868,12 @@ private:
             float bandY = pill_y_ + t.s6 + r * (cell_h() + t.s6) + t.ctlH + t.s4;
             for (int g = 0; g < GRP_COUNT; ++g) {
                 if (group_caption_[g].empty() || grp_w_[r][g] <= 0.0f) continue;
+                // The unsaved-edits caption is the louder of the two wordings (card #22):
+                // textSecondary on the pill surface is 7.36:1, and textTertiary would be 4.27:1 -
+                // under AA for caption-size text, so the warning uses textPrimary.
+                ID2D1SolidColorBrush* gb = (g == GRP_OUTPUT && dirty_) ? cv_.brText : brCap;
                 cv_.draw_layout(group_caption_[g].c_str(), cv_.fmtCaption, grp_x_[r][g], bandY,
-                                grp_w_[r][g], capH, brCap, DWRITE_TEXT_ALIGNMENT_LEADING,
+                                grp_w_[r][g], capH, gb, DWRITE_TEXT_ALIGNMENT_LEADING,
                                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             }
         }
@@ -1064,6 +1103,21 @@ private:
         c.stroke = cur_;
         undo_.push_back(c);
         redo_.clear();
+        mark_edited();
+    }
+
+    // Card #22, as the owner settled it: two questions, two counters.
+    //   edited_ - the document differs from the captured frame: that is what makes Save worth having
+    //             at all, and it is never cleared by an output (a copied frame can still be saved).
+    //   dirty_  - edits that have not left the editor yet: what the output caption shows and what
+    //             closing the editor has to ask about. Copy and Save clear it, nothing else does.
+    void mark_edited() { edited_ = true; set_dirty(true); }
+
+    void set_dirty(bool d) {
+        if (dirty_ == d) return;
+        dirty_ = d;
+        layout();                     // the caption text lives in the slots, not only in the painter
+        InvalidateRect(hwnd_, nullptr, TRUE);
     }
 
     void do_action(int a) {
@@ -1084,18 +1138,21 @@ private:
                 strokes_.push_back(c.stroke);
             }
             to.push_back(std::move(c));
+            mark_edited();                        // an undo changes the result too (#22)
         } else if (a == 2) {                                    // clipboard only, no file (8.7)
             if (copy_fn_ && copy_fn_(compose_result())) {
-                produced_ = true; status_msg_ = L"Скопировано в буфер обмена"; status_bad_ = false;
+                produced_ = true; set_dirty(false);   // the edits have left the editor (#22)
+                status_msg_ = L"Скопировано в буфер обмена"; status_bad_ = false;
             } else {
                 status_msg_ = L"Не удалось скопировать"; status_bad_ = true;
             }
         } else if (a == 3) {                                    // file, and the window stays open
-            if (!save_fn_) return;
+            if (!save_fn_ || !edited_) return;                   // Save is disabled in that state (#22)
             std::wstring path;
             OutputResult r = save_fn_(compose_result(), hwnd_, path);
             if (r == OUT_SAVED) {
-                produced_ = true; status_msg_ = L"Сохранено: " + path; status_bad_ = false;
+                produced_ = true; dirty_ = false;
+                status_msg_ = L"Сохранено: " + path; status_bad_ = false;
             } else if (r == OUT_CANCELLED) {
                 status_msg_ = L"Сохранение отменено"; status_bad_ = false;
             } else {
@@ -1103,6 +1160,32 @@ private:
             }
         }
         InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+
+    // Card #22: closing with unsaved edits asks instead of deciding for the user. TaskDialog and not
+    // MessageBox because the three answers are the product's own words, and the acceptance harness
+    // drives dialogs through BM_CLICK - the same route every other dialog in this project uses.
+    bool ask_discard() {
+        const int ID_SAVE = 100, ID_DROP = 101, ID_CANCEL = 102;
+        TASKDIALOG_BUTTON btns[3] = { { ID_SAVE, L"Сохранить" }, { ID_DROP, L"Не сохранять" },
+                                      { ID_CANCEL, L"Отмена" } };
+        TASKDIALOGCONFIG c = {};
+        c.cbSize = sizeof(c);
+        c.hwndParent = hwnd_;
+        c.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+        c.pszWindowTitle = L"Закрыть редактор?";
+        c.pszMainInstruction = L"Есть несохранённые правки. Сохранить их перед закрытием?";
+        c.pButtons = btns;
+        c.cButtons = 3;
+        c.nDefaultButton = ID_CANCEL;               // the safe answer is the one Enter gives
+        int pressed = ID_CANCEL;
+        if (FAILED(TaskDialogIndirect(&c, &pressed, nullptr, nullptr))) return false;
+        if (pressed == ID_SAVE) {
+            do_action(3);                           // the ordinary Save path, folder dialog included
+            return !dirty_;                         // a cancelled or failed save keeps the window open
+        }
+        if (pressed == ID_DROP) { discard_confirmed_ = true; return true; }
+        return false;
     }
 
     void on_move(int mx, int my) {
@@ -1155,7 +1238,7 @@ private:
         if (ctrl && vk == 'Y') { do_action(1); return; }
         if (ctrl && vk == 'S') { do_action(3); return; }
         if (ctrl && vk == 'C') { do_action(2); return; }
-        if (vk == VK_ESCAPE) { PostQuitMessage(0); return; }
+        if (vk == VK_ESCAPE) { PostMessageW(hwnd_, WM_CLOSE, 0, 0); return; }   // one closing path (#22)
         if (vk == VK_DELETE) {
             if (!undo_.empty() && !undo_.back().is_crop) do_action(0);
             return;
@@ -1208,6 +1291,7 @@ private:
         undo_.push_back(std::move(c));
         redo_.clear();
         refresh_image_bitmap();
+        mark_edited();                // a crop is an edit (#22)
     }
 
     // Undoing a crop puts back pixels that are larger than the window may currently be.
@@ -1390,6 +1474,9 @@ private:
     std::wstring status_msg_;
     bool status_bad_ = false;
     bool produced_ = false;                     // at least one Save/Copy happened in this session
+    bool dirty_ = false;                        // edits that have not left through Save/Copy yet (#22)
+    bool edited_ = false;                       // the document differs from the captured frame (#22)
+    bool discard_confirmed_ = false;            // the user already answered "Не сохранять" (#22)
     SaveFn save_fn_ = nullptr;
     CopyFn copy_fn_ = nullptr;
     int frame_w_ = 0, frame_h_ = 0;

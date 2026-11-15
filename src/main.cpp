@@ -349,7 +349,9 @@ static void do_capture(bool region_mode, const RECT* fixed_region = nullptr) {
     // moment of the click, both of them with the window still open (card #8).
     Editor ed;
     ed.set_output(save_output, copy_output);
-    if (!ed.run(img)) notify(L"Capture discarded - nothing was saved.");
+    // "Не сохранять" in the close question already said this out loud (card #22): the editor reports
+    // that it asked and the user chose, so a second announcement would be a duplicate.
+    if (!ed.run(img) && !ed.discard_confirmed()) notify(L"Capture discarded - nothing was saved.");
 }
 
 static BOOL CALLBACK enum_top(HWND h, LPARAM l) {
@@ -456,7 +458,7 @@ static int run_mode(const Args& a) {
         }
         Editor ed;
         ed.set_output(save_output, copy_output);
-        if (!ed.run(img)) notify(L"Editing discarded - nothing was saved.");
+        if (!ed.run(img) && !ed.discard_confirmed()) notify(L"Editing discarded - nothing was saved.");
         return 0;
     }
 
