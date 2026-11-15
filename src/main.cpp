@@ -260,7 +260,16 @@ static int run_selftest() {
         }
         report(L"png_signature", sig_ok);
         report(L"png_dimensions", ihdr_ok);
-        wprintf(L"     wrote %ls attr=%lu\n", outp.c_str(), attr);
+        // Card #17: the stored-block writer made a saved frame about the size of its raw pixels.
+        // The number is reported so the acceptance test has something to compare against.
+        WIN32_FILE_ATTRIBUTE_DATA fad = {};
+        DWORD raw = (DWORD)((size_t)reg.w * reg.h * 4);
+        if (GetFileAttributesExW(outp.c_str(), GetFileExInfoStandard, &fad))
+            wprintf(L"     wrote %ls attr=%lu size=%lu bytes (raw pixels %lu)\n",
+                    outp.c_str(), attr, fad.nFileSizeLow, raw);
+        else
+            wprintf(L"     wrote %ls attr=%lu size=unknown (raw pixels %lu)\n",
+                    outp.c_str(), attr, raw);
     }
 
     // 6. clipboard round-trip: copy then read back CF_DIB and compare dimensions
