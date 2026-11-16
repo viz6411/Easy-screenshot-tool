@@ -96,8 +96,9 @@ def main():
         shutil.rmtree(dest)
     os.makedirs(dest)
     assets = []
-    for exe, name in (('ShotMvp.exe', 'ShotMvp-%s.exe' % ver),
-                      ('ShotMvp_console.exe', 'ShotMvp_console-%s.exe' % ver)):
+    short = ver.lstrip('v')      # PLAN.md §6: the version in the name, not the tag (ShotMvp-0.2.1.exe)
+    for exe, name in (('ShotMvp.exe', 'ShotMvp-%s.exe' % short),
+                      ('ShotMvp_console.exe', 'ShotMvp_console-%s.exe' % short)):
         srcf = os.path.join(work, 'build', exe)
         if not os.path.isfile(srcf):
             sys.exit('no %s in the build output' % srcf)
