@@ -111,6 +111,7 @@ public:
             DestroyWindow(hwnd_); hwnd_ = nullptr;
             return false;
         }
+        create_tooltips();      // R18: before the first ShowWindow, so the first hover already works
         fit_window(scrW, scrH, frameW, frameH);
 
         ShowWindow(hwnd_, SW_SHOW);
@@ -280,6 +281,10 @@ private:
             case WM_CLOSE:
                 if (dirty_ && !ask_discard()) return 0;    // "Отмена": the window stays open
                 DestroyWindow(h);
+                return 0;
+
+            case WM_TIMER:
+                if (wp == TIP_TIMER) tip_delay();     // R18: the hover has held still long enough
                 return 0;
 
             case WM_GETMINMAXINFO: {
@@ -664,6 +669,8 @@ private:
         fit_ = fit_for(cw, ch);
         labels_ = fit_has_labels(fit_);
         build_slots();                          // rows are already centred inside the pill
+        validate_focus();                       // a reflow can drop the row the focus sat in
+        tip_revalidate();                       // ... and it moves the controls a tip describes
         pill_x_ = (float)((cw - pill_w_) / 2);
         pill_y_ = (float)t.s12;
         for (auto& s : slots_) { s.x += pill_x_; s.y += pill_y_ + t.s6; }
@@ -824,8 +831,7 @@ private:
                 }
 
                 case KIND_ACTION: {
-                    bool off = (s.action == 0 && undo_.empty()) || (s.action == 1 && redo_.empty()) ||
-                               (s.action == 3 && !edited_);  // card #22: nothing edited, nothing to save
+                    bool off = !slot_enabled(s);   // the same liveness the keyboard and the tip use
                     ui::ControlState st = off ? ui::ST_DISABLED : state_of(s);
                     cv_.control(cx, s.y, (float)t.ctlH, (float)t.ctlH, st, group_of(s));
                     // History has no accent state, but its resting glyph is the accent (8.2); output
@@ -914,6 +920,20 @@ private:
                     if (on || hov) cap_br = cv_.brText;
                     break;
                 }
+            }
+
+            // R16/R17: the keyboard focus outline. It appears only after Tab has moved the focus
+            // (never from a mouse click), which is how Win32 shows focus without painting a ring
+            // around whatever the pointer last happened to be on. Fluent draws it on the control's
+            // own shape: chips sit s2 apart, so a ring standing outside a control would land on its
+            // neighbour.
+            if (is_focused(s)) {
+                float ins = 1.0f * t.k;
+                D2D1_ROUNDED_RECT fring = ui::RR(cx + ins, s.y + ins,
+                                                 (float)t.ctlH - 2.0f * ins,
+                                                 (float)t.ctlH - 2.0f * ins,
+                                                 (std::max)(1.0f, t.rControl - ins));
+                rt_->DrawRoundedRectangle(&fring, cv_.brFocus, 2.0f * t.k, cv_.solid);
             }
 
             // Second caption band: the control's own caption, under the group caption of the first
@@ -1102,17 +1122,12 @@ private:
     }
 
     void on_down(int mx, int my) {
+        tip_hide();                       // R18: a click is not a hover any more
         if (const Slot* s = hit(mx, my)) {
             if (text_edit_) commit_text();          // a control click keeps what has been typed
             hover_slot_ = slot_index(*s);
-            switch (s->kind) {
-                case KIND_TOOL:  set_tool(s->tool); return;
-                case KIND_COLOR: color_ = s->color; InvalidateRect(hwnd_, nullptr, TRUE); return;
-                case KIND_WIDTH: width_ = s->width; InvalidateRect(hwnd_, nullptr, TRUE); return;
-                case KIND_BACKDROP: backdrop_ = s->width; InvalidateRect(hwnd_, nullptr, TRUE); return;
-                case KIND_ACTION: do_action(s->action); return;
-                default: break;
-            }
+            activate_slot(*s);            // the same activation Enter/Space performs (R17)
+            return;
         }
 
         // Card #24: under the visible band there is no picture to draw on. Strokes started there
@@ -1163,6 +1178,230 @@ private:
         text_buffer_.clear();
         cur_ = Stroke{};
         InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+
+    // Focus is held as the identity of the control (kind + id within its group), not as an index:
+    // layout() rebuilds slots_ whenever the window is resized or the tool changes, and an index
+    // would silently mean a different control afterwards (R17).
+    bool is_focused(const Slot& s) const { return s.id == focus_id_ && (int)s.kind == focus_kind_; }
+
+    void set_focus(int kind, int id) {
+        if (kind == focus_kind_ && id == focus_id_) return;
+        focus_kind_ = kind; focus_id_ = id;
+        InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+
+    void clear_focus() { set_focus(-1, -1); }
+
+    // Tab walks the controls in the order they are painted, wrapping at the ends. With no control
+    // focused yet, Tab lands on the first one and Shift+Tab on the last.
+    void move_focus(int dir) {
+        int n = (int)slots_.size();
+        if (!n) return;
+        int from = -1;
+        for (int i = 0; i < n; ++i) if (is_focused(slots_[i])) { from = i; break; }
+        int start = (from < 0) ? (dir > 0 ? -1 : 0) : from;
+        for (int step = 1; step <= n; ++step) {
+            int i = ((start + dir * step) % n + n) % n;
+            if (!slot_enabled(slots_[i])) continue;
+            set_focus((int)slots_[i].kind, slots_[i].id);
+            tip_for_focus();          // R18: the keyboard control names itself the same way
+            return;
+        }
+    }
+
+    void activate_focus() {
+        for (auto& s : slots_) if (is_focused(s)) { activate_slot(s); return; }
+    }
+
+    // Arrows move inside the group the focus already sits in (R17); Tab is what crosses groups.
+    // Direction is read from the measured positions, not from slot order, because a wrapped group
+    // (levels 2/3) puts the same group on two rows.
+    void move_focus_arrow(int dx, int dy) {
+        int cur = -1;
+        for (int i = 0; i < (int)slots_.size(); ++i) if (is_focused(slots_[i])) { cur = i; break; }
+        if (cur < 0) { move_focus(dx ? dx : dy); return; }
+        Group g = slots_[cur].group;
+        int best = -1; float best_score = 1e9f;
+        for (int i = 0; i < (int)slots_.size(); ++i) {
+            Slot& s = slots_[i];
+            if (i == cur || s.group != g || !slot_enabled(s)) continue;
+            int ddx = (int)(s.x - slots_[cur].x), ddy = (int)(s.y - slots_[cur].y);
+            if (dx && (dx > 0) != (ddx > 0)) continue;
+            if (dy && (dy > 0) != (ddy > 0)) continue;
+            float score = dx ? (float)abs(ddx) : (float)abs(ddy) + 0.01f * (float)abs(ddx);
+            if (score < best_score) { best_score = score; best = i; }
+        }
+        if (best < 0) return;
+        set_focus((int)slots_[best].kind, slots_[best].id);
+        tip_for_focus();              // R18: same name for the control the arrows reached
+    }
+
+    // An activation can disable the control it ran on (Undo with an empty history), and layout()
+    // can drop the row it sat in. A focus left on a hole would draw a ring around nothing.
+    void validate_focus() {
+        if (focus_id_ < 0) return;
+        for (auto& s : slots_) {
+            if (!is_focused(s)) continue;
+            if (slot_enabled(s)) return;
+            break;
+        }
+        clear_focus();
+        tip_hide();
+    }
+
+    // One answer to "is this control live right now", shared by the painter, the keyboard and the
+    // tooltip: the same three conditions written in three places is how they drift apart (R16/R17/R18).
+    bool slot_enabled(const Slot& s) const {
+        if (s.kind == KIND_SEP) return false;
+        // A control drawn disabled cannot be reached by the keyboard and gets no tip either: the
+        // three conditions are the ones the painter uses for ST_DISABLED and card #22 put on Save.
+        if (s.action == 0 && undo_.empty()) return false;
+        if (s.action == 1 && redo_.empty()) return false;
+        if (s.action == 3 && !edited_) return false;   // card #22 gate
+        return true;
+    }
+
+    // ---- R18: the Fluent tooltip (card #27) ------------------------------------------------
+    // comctl32's own tooltip control rather than a self-drawn balloon: Windows 11 themes it, it
+    // scales with DPI on its own and it already speaks the user's language - a drawn balloon has to
+    // get all three wrong from scratch. It is activated by this class instead of by the control's
+    // built-in mouse tracking, because then the position is ours: the tip can be kept off the
+    // control it describes and it can appear for a control reached with Tab, not only for one
+    // sitting under the pointer.
+    static const UINT_PTR TIP_TIMER = 0x7A;     // this window's hover-delay timer id
+    static const int TIP_DELAY_MS = 400;        // the delay Windows' own tooltips start with
+
+    static UINT tool_id(const Slot& s) { return (UINT)s.kind * 100u + (UINT)s.id + 1u; }
+
+    RECT chip_rect(const Slot& s) const {
+        const float cx = chip_x(s);
+        return RECT{ (int)cx, (int)s.y, (int)(cx + theme_.ctlH), (int)(s.y + theme_.ctlH) };
+    }
+
+    static const wchar_t* color_name(int i) {
+        static const wchar_t* n[7] = { L"красный", L"зелёный", L"пурпурный", L"синий",
+                                       L"жёлтый", L"чёрный", L"белый" };
+        return n[i % 7];
+    }
+
+    // R18 asks for the command name and its hotkey. Every control that has a hotkey says it:
+    // the tools are keys 1-6 (on_key), the four actions are Ctrl+Z / Ctrl+Y / Ctrl+C / Ctrl+S.
+    // Colours, line widths and backdrops have no key today, so their tip is the name only -
+    // that gap is recorded on card #27, not papered over.
+    std::wstring tip_text(const Slot& s) const {
+        switch (s.kind) {
+            case KIND_TOOL: {
+                static const wchar_t* key[6] = { L"1", L"2", L"3", L"4", L"5", L"6" };
+                return std::wstring(tool_caption(s.id)) + L" (" + key[s.id % 6] + L")";
+            }
+            case KIND_COLOR:
+                return std::wstring(L"Цвет: ") + color_name(s.id);
+            case KIND_WIDTH:
+                return std::wstring(L"Толщина: ") + std::to_wstring(s.width) + L" px";
+            case KIND_BACKDROP: {
+                static const wchar_t* b[3] = { L"без подложки", L"светлая подложка", L"тёмная подложка" };
+                return std::wstring(L"Фон: ") + b[s.width % 3];
+            }
+            case KIND_ACTION: {
+                static const wchar_t* a[4] = { L"Отменить (Ctrl+Z)", L"Повторить (Ctrl+Y)",
+                                               L"Копировать (Ctrl+C)", L"Сохранить (Ctrl+S)" };
+                return a[(s.action >= 0 && s.action < 4) ? s.action : 3];
+            }
+            default: return std::wstring();
+        }
+    }
+
+    void create_tooltips() {
+        INITCOMMONCONTROLSEX icc{ (DWORD)sizeof(icc), ICC_STANDARD_CLASSES };
+        InitCommonControlsEx(&icc);
+        tip_ = CreateWindowExW(0, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                               0, 0, 0, 0,              // CWRTUSEXISTINGWINDOW: the control sizes itself
+                               hwnd_, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!tip_) return;
+        SendMessageW(tip_, TTM_SETMAXTIPWIDTH, 0, 400);      // a wrapped tip beats a clipped one
+    }
+
+    void tip_show(const Slot& s) {
+        tip_hide();
+        if (!tip_ || !slot_enabled(s)) return;
+        tip_text_ = tip_text(s);
+        if (tip_text_.empty()) return;
+        TOOLINFOW ti{};
+        ti.cbSize = (UINT)sizeof(ti);
+        ti.hwnd = hwnd_;
+        ti.uId = tool_id(s);
+        ti.rect = chip_rect(s);
+        ti.lpszText = (LPWSTR)tip_text_.c_str();     // member buffer: valid while the control reads it
+        SendMessageW(tip_, TTM_ADDTOOL, 0, (LPARAM)&ti);
+        const RECT chip = ti.rect;
+        POINT below{ chip.left, chip.bottom + (int)theme_.s2 };
+        ClientToScreen(hwnd_, &below);
+        SendMessageW(tip_, TTM_TRACKPOSITION, 0, MAKELPARAM(below.x, below.y));
+        SendMessageW(tip_, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+        tip_id_ = (int)ti.uId;
+        // The balloon sizes itself as it activates, so only now can it be measured against the
+        // control and against the window and moved off both: R18 - a tip never covers its own
+        // control, and it never hangs outside the window it belongs to.
+        RECT tr{}, win{};
+        if (!GetWindowRect(tip_, &tr) || !GetWindowRect(hwnd_, &win)) return;
+        const int w = tr.right - tr.left, h = tr.bottom - tr.top, gap = (int)theme_.s2;
+        int x = below.x, y = below.y;
+        if (x + w > win.right) x = win.right - w;
+        if (x < win.left) x = win.left;
+        if (y + h > win.bottom) y = chip.top - h - gap;      // no room below: put it above the chip
+        if (y < win.top) y = win.top;
+        if (x != tr.left || y != tr.top)
+            SetWindowPos(tip_, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    void tip_hide() {
+        KillTimer(hwnd_, TIP_TIMER);
+        if (tip_id_ < 0) return;
+        if (tip_) {
+            TOOLINFOW ti{};
+            ti.cbSize = (UINT)sizeof(ti);
+            ti.hwnd = hwnd_;
+            ti.uId = (UINT)tip_id_;
+            SendMessageW(tip_, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
+        }
+        tip_id_ = -1;
+    }
+
+    // The tip follows the hover, but only after the delay, and only for a control that is live.
+    void tip_delay() {
+        KillTimer(hwnd_, TIP_TIMER);
+        if (hover_slot_ < 0 || hover_slot_ >= (int)slots_.size()) return;
+        tip_show(slots_[hover_slot_]);
+    }
+
+    void tip_for_focus() {
+        for (auto& s : slots_) if (is_focused(s)) { tip_show(s); return; }
+        tip_hide();
+    }
+
+    // A tip must not outlive the state it describes: the «Сохранить» that has just saved, or the
+    // Undo whose history just ran out, has no tip any more.
+    void tip_revalidate() {
+        if (tip_id_ < 0) return;
+        for (auto& s : slots_) if (tool_id(s) == (UINT)tip_id_) {
+            if (slot_enabled(s)) return;
+            break;
+        }
+        tip_hide();
+    }
+
+    // The activation a click performs, shared with Enter/Space so the keyboard reaches the exact
+    // same behaviour the mouse does (R17 - "same affordance, second entry point").
+    void activate_slot(const Slot& s) {
+        switch (s.kind) {
+            case KIND_TOOL:  set_tool(s.tool); return;
+            case KIND_COLOR: color_ = s.color; InvalidateRect(hwnd_, nullptr, TRUE); return;
+            case KIND_WIDTH: width_ = s.width; InvalidateRect(hwnd_, nullptr, TRUE); return;
+            case KIND_BACKDROP: backdrop_ = s.width; InvalidateRect(hwnd_, nullptr, TRUE); return;
+            case KIND_ACTION: do_action(s.action); return;
+            default: break;
+        }
     }
 
     void commit_stroke() {
@@ -1227,6 +1466,8 @@ private:
                 status_msg_ = L"Не удалось сохранить: " + path; status_bad_ = true;
             }
         }
+        validate_focus();   // R17: an action can disable the control the focus sits on
+        tip_revalidate();   // R18: ... and it invalidates the tip that control was describing
         InvalidateRect(hwnd_, nullptr, TRUE);
     }
 
@@ -1276,7 +1517,12 @@ private:
 
         const Slot* s = hit(mx, my);
         int idx = s ? slot_index(*s) : -1;
-        if (idx != hover_slot_) { hover_slot_ = idx; InvalidateRect(hwnd_, nullptr, TRUE); }
+        if (idx != hover_slot_) {
+            hover_slot_ = idx;
+            InvalidateRect(hwnd_, nullptr, TRUE);
+            tip_hide();                                   // R18: the old control's tip goes with it
+            if (idx >= 0) SetTimer(hwnd_, TIP_TIMER, TIP_DELAY_MS, nullptr);
+        }
     }
 
     void on_up(int mx, int my) {
@@ -1298,9 +1544,16 @@ private:
     // keyboard of whoever owns it, so a Ctrl shortcut could only be produced by injecting keys into
     // the whole session - which is what made every automated check fight the owner for the keyboard
     // (card #21). Real presses and posted ones both arrive through this window's queue.
-    void on_key_up(int vk) { if (vk == VK_CONTROL) ctrl_held_ = false; }
+    void on_key_up(int vk) {
+        if (vk == VK_CONTROL) ctrl_held_ = false;
+        if (vk == VK_SHIFT) shift_held_ = false;
+    }
 
     void on_key(int vk) {
+        // Shift is read the same way Ctrl is: from this window's own messages. GetKeyState reports the
+        // physical keyboard, so a posted Shift+Tab (what the automated checks send) would otherwise
+        // look like a plain Tab.
+        if (vk == VK_SHIFT) { shift_held_ = true; return; }
         if (vk == VK_CONTROL) { ctrl_held_ = true; return; }
         bool ctrl = ctrl_held_ || (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         if (text_edit_ && !ctrl) {
@@ -1311,7 +1564,25 @@ private:
         if (ctrl && vk == 'Y') { do_action(1); return; }
         if (ctrl && vk == 'S') { do_action(3); return; }
         if (ctrl && vk == 'C') { do_action(2); return; }
-        if (vk == VK_ESCAPE) { PostMessageW(hwnd_, WM_CLOSE, 0, 0); return; }   // one closing path (#22)
+        // R17: Tab reaches every control the mouse can reach, Enter/Space presses it. While a label
+        // is being typed Tab belongs to the text, not to the pill - otherwise typing a caption would
+        // walk away from the field it is in.
+        if (vk == VK_TAB && !text_edit_) {
+            bool shift = shift_held_ || (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            move_focus(shift ? -1 : 1);
+            return;
+        }
+        if ((vk == VK_RETURN || vk == VK_SPACE) && !text_edit_ && !drawing_ && focus_id_ >= 0) {
+            activate_focus();
+            return;
+        }
+        if (vk == VK_ESCAPE) { clear_focus(); PostMessageW(hwnd_, WM_CLOSE, 0, 0); return; }   // one closing path (#22)
+        if (!text_edit_ && !drawing_) {
+            if (vk == VK_LEFT)  { move_focus_arrow(-1, 0); return; }
+            if (vk == VK_RIGHT) { move_focus_arrow(1, 0); return; }
+            if (vk == VK_UP)    { move_focus_arrow(0, -1); return; }
+            if (vk == VK_DOWN)  { move_focus_arrow(0, 1); return; }
+        }
         if (vk == VK_DELETE) {
             if (!undo_.empty() && !undo_.back().is_crop) do_action(0);
             return;
@@ -1540,9 +1811,14 @@ private:
     Stroke cur_;
     bool drawing_ = false, crop_active_ = false, text_edit_ = false;
     bool ctrl_held_ = false;                    // Ctrl as this window saw it, not as GetKeyState says
+    bool shift_held_ = false;                   // Shift, read the same way (Shift+Tab)
     POINT crop_a_{}, crop_b_{};
     std::wstring text_buffer_;
     int hover_slot_ = -1;
+    int focus_kind_ = -1, focus_id_ = -1;      // keyboard focus (R16/R17): -1 = no control focused
+    HWND tip_ = nullptr;                        // comctl32 tooltip (R18): one tracked tool per control
+    int tip_id_ = -1;                           // the tool currently tracked, -1 = nothing shown
+    std::wstring tip_text_;                     // lives as long as the control reads it
     int backdrop_ = 0;                          // 0 none / 1 light / 2 dark, applies to new text
     std::wstring status_msg_;
     bool status_bad_ = false;

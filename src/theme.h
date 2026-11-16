@@ -132,7 +132,9 @@ struct Theme {
 
         t.borderSoft   = rgba(255, 255, 255, 0.07f);
         t.borderStrong = rgba(255, 255, 255, 0.14f);
-        t.focusRing    = rgba(255, 255, 255, 0.30f);
+        // R16 / WCAG 1.4.11: at 0.30 white the ring measured 2.9:1 against the pill surface - under
+        // the 3:1 floor. 0.62 puts it at ~7:1 against both the pill and a control fill.
+        t.focusRing    = rgba(255, 255, 255, 0.62f);
 
         t.textPrimary   = rgba(0xEC, 0xEF, 0xF4);
         t.textSecondary = rgba(0xAB, 0xB3, 0xBE);
