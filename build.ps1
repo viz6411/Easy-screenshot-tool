@@ -27,6 +27,12 @@ $res = Join-Path $out 'app_res.o'
 windres '-J' 'rc' '-i' (Join-Path $root 'src\app.rc') '-O' 'coff' '-o' $res '-I' (Join-Path $root 'src')
 if ($LASTEXITCODE) { throw "windres failed for $res" }
 
+# ld prints ".rsrc merge failure: multiple non-default manifests" on every link here: MinGW's own
+# default manifest (asInvoker + longPathAware) and src\app.rc's manifest (PerMonitorV2 DPI +
+# Common-Controls 6) both arrive as RT_MANIFEST id 1. The one that survives is ours - proven by
+# tests/dpi_verify.py (the overlay covers the physical screen only when DPI virtualisation is off)
+# and by the localised TaskDialog card #22 added. -DNO_DEFAULT_MANIFEST does not silence the
+# warning on this toolchain, so the warning is cosmetic and the build stays as it is.
 g++ @common '-mwindows' $src $res -o $gui @libs
 if ($LASTEXITCODE) { throw "build of $gui failed" }
 
