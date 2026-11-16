@@ -113,12 +113,14 @@ def main():
 
     # 4. What the release contains, taken from the milestone so the text cannot drift from the board.
     if not args.no_milestone and args.milestone:
-        ms = [m for m in __import__('json').loads(gh('api', 'repos/%s/milestones' % REPO,
+        # `-X GET` is not decoration: `gh api` switches to POST as soon as -f appears, and POST to
+        # /milestones means "create a milestone" - the call would fail instead of listing them.
+        ms = [m for m in __import__('json').loads(gh('api', '-X', 'GET', 'repos/%s/milestones' % REPO,
                                                      '-f', 'state=open', '-f', 'per_page=100'))
               if m['title'] == args.milestone]
         if not ms:
             sys.exit('milestone %r not found (open milestones only)' % args.milestone)
-        issues = [i for i in __import__('json').loads(gh('api', 'repos/%s/issues' % REPO,
+        issues = [i for i in __import__('json').loads(gh('api', '-X', 'GET', 'repos/%s/issues' % REPO,
                                                           '-f', 'milestone=%d' % ms[0]['number'],
                                                           '-f', 'state=all', '-f', 'per_page=100'))
                   if 'pull_request' not in i]
@@ -146,10 +148,10 @@ def main():
              '--jq', '"\\(.tagName): \\(.assets | map(.name + \" \" + (.size|tostring)) | join(\", \"))"'))
 
     if not args.no_milestone and args.milestone:
-        ms_no = __import__('json').loads(gh('api', 'repos/%s/milestones' % REPO, '-f', 'state=all',
+        ms_no = __import__('json').loads(gh('api', '-X', 'GET', 'repos/%s/milestones' % REPO, '-f', 'state=all',
                                             '-f', 'per_page=100'))
         ms_no = [m for m in ms_no if m['title'] == args.milestone][0]
-        open_issues = __import__('json').loads(gh('api', 'repos/%s/issues' % REPO,
+        open_issues = __import__('json').loads(gh('api', '-X', 'GET', 'repos/%s/issues' % REPO,
                                                   '-f', 'milestone=%d' % ms_no['number'],
                                                   '-f', 'state=open', '-f', 'per_page=100'))
         open_issues = [i for i in open_issues if 'pull_request' not in i]
