@@ -117,7 +117,7 @@ def main():
         # `-X GET` is not decoration: `gh api` switches to POST as soon as -f appears, and POST to
         # /milestones means "create a milestone" - the call would fail instead of listing them.
         ms = [m for m in __import__('json').loads(gh('api', '-X', 'GET', 'repos/%s/milestones' % REPO,
-                                                     '-f', 'state=open', '-f', 'per_page=100'))
+                                                     '-f', 'state=all', '-f', 'per_page=100'))
               if m['title'] == args.milestone]
         if not ms:
             sys.exit('milestone %r not found (open milestones only)' % args.milestone)
@@ -139,8 +139,11 @@ def main():
         git('tag', '-a', ver, '-m', 'ShotMvp %s' % ver)
         git('push', 'origin', ver)
         print('tagged %s' % ver)
+    # `gh release edit` takes one argument: assets go in through `upload`, which replaces a file of
+    # the same name instead of leaving two of them next to each other.
     if gh_ok('release', 'view', ver, '--repo', REPO):
-        gh('release', 'edit', ver, '--repo', REPO, '--notes-file', notes.name,
+        gh('release', 'edit', ver, '--repo', REPO, '--notes-file', notes.name)
+        gh('release', 'upload', ver, '--repo', REPO, '--clobber',
            *[os.path.abspath(f) for f in assets])
     else:
         gh('release', 'create', ver, '--repo', REPO, '--title', 'ShotMvp %s' % ver,
@@ -156,8 +159,11 @@ def main():
                                                   '-f', 'milestone=%d' % ms_no['number'],
                                                   '-f', 'state=open', '-f', 'per_page=100'))
         open_issues = [i for i in open_issues if 'pull_request' not in i]
-        print(gh('api', '-X', 'PATCH', 'repos/%s/milestones/%d' % (REPO, ms_no['number']),
-                 '-f', 'state=closed', '--jq', '"milestone #\\(.number) \\(.state)"'))
+        if ms_no['state'] == 'open':
+            print(gh('api', '-X', 'PATCH', 'repos/%s/milestones/%d' % (REPO, ms_no['number']),
+                     '-f', 'state=closed', '--jq', '"milestone #\\(.number) \\(.state)"'))
+        else:
+            print('milestone #%d is already %s' % (ms_no['number'], ms_no['state']))
         if open_issues:
             print('open issues left in the milestone (milestone closed anyway): %s'
                   % [i['number'] for i in open_issues])
