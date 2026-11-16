@@ -407,6 +407,17 @@ def keep(files, folder):
     return files
 
 
+def edit_something():
+    """Card #22 made "Сохранить" a live control only once the document differs from the captured
+    frame (both by mouse and by Ctrl+S - Editor::do_action 3 refuses without an edit). Every case
+    below saves, so each one first draws a stroke, exactly the way sections F-H do. The assertions
+    themselves are unchanged."""
+    fr, pill = P.grab_pill()
+    im = P.content_bbox(fr, pill, P.strip_geometry(fr, pill)[0])
+    P.drag(*fr.screen(im['x0'] + 40, im['y0'] + 40), *fr.screen(im['x0'] + 240, im['y0'] + 120))
+    time.sleep(0.5)
+
+
 try:
     os.makedirs(CHOSEN, exist_ok=True)
     common = {'clipboard': 1, 'hotkey': 'Ctrl+Shift+P', 'hotkey_window': 'Ctrl+Shift+W',
@@ -415,6 +426,7 @@ try:
     write_ini(dict(common, save_ask=0, save_dir=CHOSEN))
     start()
     time.sleep(1.2)
+    edit_something()
     mark = time.time()
     P.ctrl_key(0x53)
     time.sleep(1.5)
@@ -429,6 +441,7 @@ try:
     write_ini(dict(common, save_ask=0), drop=('save_dir',))          # no save_dir line at all
     start()
     time.sleep(1.2)
+    edit_something()
     fr_no, pill_no = P.grab_pill()
     ink_before = strip_right_ink(fr_no, P.strip_geometry(fr_no, pill_no)[0])
     mark = time.time()
@@ -473,6 +486,7 @@ try:
     write_ini(dict(common, save_ask=1, save_dir=CHOSEN, name_format='tester02_%Y-%m-%d_%H-%M-%S'))
     start()
     time.sleep(1.2)
+    edit_something()
     mark = time.time()
     P.ctrl_key(0x53)
     dlg3 = wait_dialog('#32770')
