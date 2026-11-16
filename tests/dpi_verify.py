@@ -89,6 +89,17 @@ try:
     check('Windows reports the editor window as per-monitor V2 DPI aware', bool(per_monitor_v2),
           'DPI awareness context of the editor window = %s' % ctx)
 
+    # Card #22 gates Ctrl+S on a real edit (Editor::do_action 3 returns without one), the same gate
+    # stage2_behaviour calibrates for. One stroke is drawn so Save becomes a live control; the DPI
+    # assertions below measure the saved file's dimensions, which a stroke does not change.
+    fr, pill = P.grab_pill()
+    im = P.content_bbox(fr, pill, P.strip_geometry(fr, pill)[0]) if pill else None
+    if not im:
+        print('no picture band found in the editor - cannot draw the edit that makes Save live')
+        fails.append('the edit for the save step'); sys.exit(1)
+    P.drag(*fr.screen(im['x0'] + 30, im['y0'] + 30), *fr.screen(im['x0'] + 200, im['y0'] + 90), hwnd=ed)
+    time.sleep(0.6)
+
     marker = time.time()
     P.ctrl_key(0x53, hwnd=ed)
     saved = None

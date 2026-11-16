@@ -99,6 +99,21 @@ def layout():
     return None, None
 
 
+def draw_a_stroke():
+    """Card #22 gates Ctrl+S on a real edit (Editor::do_action 3 returns without one) - the same
+    gate stage2_behaviour calibrates for. The assertions below are unchanged: a stroke is what makes
+    Save a live control, nothing more."""
+    fr, pill = P.grab_pill()
+    if not pill:
+        return False
+    im = P.content_bbox(fr, pill, P.strip_geometry(fr, pill)[0])
+    if not im:
+        return False
+    P.drag(*fr.screen(im['x0'] + 30, im['y0'] + 30), *fr.screen(im['x0'] + 200, im['y0'] + 90))
+    time.sleep(0.6)
+    return True
+
+
 # ------------------------------------------------------------------ setup -----------------
 os.makedirs(DIR, exist_ok=True)
 for f in os.listdir(DIR):
@@ -137,6 +152,11 @@ try:
           % (block(BLUE, 0, 0), block(RED, 200, 0)))
 
     # B ---------------------------------------------------------------- save it back out
+    # Undo puts the document back to exactly the pixels that were opened, so what Ctrl+S writes
+    # here is still an untouched round trip of the source file.
+    if not draw_a_stroke():
+        print('could not draw the edit that makes Save live'); stop(); sys.exit(1)
+    P.ctrl_key(0x5A)                                            # Ctrl+Z: the opened pixels again
     marker = time.time()
     P.ctrl_key(0x53)                                            # Ctrl+S
     out = saved_since(marker)
@@ -154,6 +174,7 @@ try:
     sw, sh = P.physical_resolution()
     start(['-grab', '-rect', '0,0,%d,%d' % (sw, sh)])
     layout()                                                    # wait until the window has painted
+    draw_a_stroke()                                             # the edit that makes Save live
     marker = time.time()
     P.ctrl_key(0x53)
     out = saved_since(marker)
